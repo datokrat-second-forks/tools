@@ -394,20 +394,50 @@ def cmd_a(args):
     attach(name)
 
 
-def pick(lines):
-    """Pick one of `lines` (tab-separated name<TAB>desc). Returns the line."""
+def cmd_logs(args):
+    # Show one specific log directly when a name is given.
+    if args.name:
+        path = sessionlog_path(args.name)
+        if not path.exists():
+            die(f"no log for '{args.name}' ({path} does not exist)")
+        sys.stdout.write(path.read_text())
+        return
+
+    logs = sorted(TMGR_DIR.glob("*.sessionlog")) if TMGR_DIR.exists() else []
+    if not logs:
+        print("No session logs yet. From inside tmux, add one with: tmgr log <text>")
+        return
+
+    lines = []
+    for f in logs:
+        name = f.name[: -len(".sessionlog")]
+        entries = [ln for ln in f.read_text().splitlines() if ln.strip()]
+        last = entries[-1] if entries else "(empty)"
+        lines.append(f"{name}\t{last}")
+
+    choice = pick(lines, preview="_logpreview", prompt="log> ")
+    if not choice:
+        return
+    path = sessionlog_path(choice.split("\t", 1)[0])
+    if path.exists():
+        sys.stdout.write(path.read_text())
+
+
+def pick(lines, preview="_preview", prompt="session> "):
+    """Pick one of `lines` (tab-separated name<TAB>extra). `preview` names the
+    hidden subcommand that renders the fzf preview for field 1. Returns the line."""
     if shutil.which("fzf"):
         self_path = os.path.realpath(sys.argv[0])
-        preview = (
-            f"{shlex.quote(sys.executable)} {shlex.quote(self_path)} _preview {{1}}"
+        preview_cmd = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(self_path)} {preview} {{1}}"
         )
         res = subprocess.run(
             [
                 "fzf",
                 "--delimiter", "\t",
                 "--with-nth", "1,2",
-                "--prompt", "session> ",
-                "--preview", preview,
+                "--prompt", prompt,
+                "--preview", preview_cmd,
                 "--preview-window", "right,55%,wrap",
             ],
             input="\n".join(lines),
@@ -465,6 +495,12 @@ def cmd_preview(args):
     print(desc if desc else "(no description)")
 
 
+def cmd_logpreview(args):
+    """Hidden: render a .sessionlog for the fzf preview pane."""
+    path = sessionlog_path(args.name)
+    sys.stdout.write(path.read_text() if path.exists() else "(no log)\n")
+
+
 def cmd_ls(args):
     files = sorted(TMGR_DIR.glob("*.session")) if TMGR_DIR.exists() else []
     live = set(running_sessions()) if shutil.which("tmux") else set()
@@ -494,7 +530,7 @@ def cmd_ls(args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(prog="tmgr", description="A small tmux session manager.")
-    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,log,ls}")
+    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,log,logs,ls}")
 
     pn = sub.add_parser("new", help="create + attach to a tracked session")
     pn.add_argument("name")
@@ -512,12 +548,20 @@ def build_parser():
     pg.add_argument("text", nargs="*", help="text to append (or pipe via stdin)")
     pg.set_defaults(func=cmd_log)
 
+    pgs = sub.add_parser("logs", help="show a session log (fzf-pick, or pass a name)")
+    pgs.add_argument("name", nargs="?", help="session whose log to show (default: pick with fzf)")
+    pgs.set_defaults(func=cmd_logs)
+
     pl = sub.add_parser("ls", help="list tracked sessions and run state")
     pl.set_defaults(func=cmd_ls)
 
     pp = sub.add_parser("_preview")  # hidden helper for fzf
     pp.add_argument("name")
     pp.set_defaults(func=cmd_preview)
+
+    plp = sub.add_parser("_logpreview")  # hidden helper for fzf
+    plp.add_argument("name")
+    plp.set_defaults(func=cmd_logpreview)
 
     return p
 

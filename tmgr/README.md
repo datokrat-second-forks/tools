@@ -30,6 +30,7 @@ Requirements:
 | `tmgr edit <name>` | Open `<name>.session` in `$EDITOR` (default `vim`). |
 | `tmgr a` | Fuzzy-pick a **running** session and attach/switch to it. |
 | `tmgr log [text]` | Append `text` to the **current** session's log (must be run inside tmux). |
+| `tmgr logs [name]` | Show a session log: fuzzy-pick one with `fzf`, or pass a name. |
 | `tmgr ls` | List tracked sessions plus their run state. |
 
 Session names must match `^[A-Za-z0-9][A-Za-z0-9-]*$` (letters, digits and `-`,
@@ -76,6 +77,19 @@ echo "longer note from a script" | tmgr log      # text can come from stdin
 The log doesn't need a `.session` file — you can log from an untracked session
 too. Entries look like `[2026-05-23 17:20] fixed the off-by-one in the lexer`,
 and `tmgr a`'s preview shows the entry count and most recent line.
+
+### `tmgr logs [name]`
+
+Shows a session log. With no argument it opens an `fzf` picker over every
+session that has a `.sessionlog`, with the full log scrollable in the preview
+pane; selecting one prints it to stdout. Pass a `name` to print that log
+directly and skip the picker. Without `fzf` it falls back to a numbered list.
+
+```sh
+tmgr logs            # browse logs with fzf
+tmgr logs myproj     # print myproj's log straight away
+tmgr logs myproj | less
+```
 
 ## The `.session` file
 
