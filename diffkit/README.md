@@ -27,6 +27,17 @@ scripts onto your `PATH` works fine.
 
 ## Install
 
+Run the bundled script, which adds this directory to your `PATH` via `~/.bashrc`
+(idempotent — it won't add a duplicate line if already present). Because all
+three tools live here, that exposes them all at once:
+
+```sh
+./install.sh
+source ~/.bashrc   # or open a new shell
+```
+
+Or symlink the scripts onto your `PATH` yourself:
+
 ```sh
 # from the repo root
 for t in structured-diff filter-diff render-diff; do
