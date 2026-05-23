@@ -49,6 +49,10 @@ def session_path(name):
     return TMGR_DIR / f"{name}.session"
 
 
+def sessionlog_path(name):
+    return TMGR_DIR / f"{name}.sessionlog"
+
+
 def now_local():
     return datetime.now().astimezone().replace(microsecond=0)
 
@@ -84,8 +88,11 @@ def _escape_multiline(s):
 
 def dump_session(name, created, description):
     out = [f'name = "{name}"', f"created = {created.isoformat()}"]
-    if description:
-        out.append('description = """\n' + _escape_multiline(description) + '\n"""')
+    # Trailing newlines are trimmed so re-dumping (e.g. on rename) is stable
+    # rather than accreting a blank line each time.
+    body = (description or "").rstrip("\n")
+    if body:
+        out.append('description = """\n' + _escape_multiline(body) + '\n"""')
     else:
         out.append('description = ""')
     return "\n".join(out) + "\n"
@@ -99,6 +106,33 @@ def write_session(name, created, description):
 def load_session(path):
     with open(path, "rb") as f:
         return tomllib.load(f)
+
+
+def append_log(name, text):
+    """Append a timestamped entry to <name>.sessionlog."""
+    TMGR_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = now_local().strftime("%Y-%m-%d %H:%M")
+    with open(sessionlog_path(name), "a") as f:
+        f.write(f"[{stamp}] {text.rstrip(chr(10))}\n")
+
+
+def rename_session(old, new):
+    """Move <old>.session (and its .sessionlog, if present) to <new>.*.
+
+    The moved .session keeps its original created time and description; only its
+    own `name` field is updated. Falls back to a plain rename if it won't parse.
+    """
+    src = session_path(old)
+    try:
+        data = load_session(src)
+        write_session(new, data.get("created") or now_local(),
+                      data.get("description") or "")
+        src.unlink()
+    except Exception:
+        src.rename(session_path(new))
+    log = sessionlog_path(old)
+    if log.exists():
+        log.rename(sessionlog_path(new))
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +158,21 @@ def running_sessions():
     if res.returncode != 0:
         return []
     return [ln for ln in res.stdout.splitlines() if ln]
+
+
+def current_session():
+    """Name of the tmux session containing the current pane, or None."""
+    if not in_tmux():
+        return None
+    args = ["display-message", "-p"]
+    pane = os.environ.get("TMUX_PANE")
+    if pane:
+        args += ["-t", pane]
+    args.append("#{session_name}")
+    res = tmux(*args, capture=True)
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip() or None
 
 
 def session_info(name):
@@ -199,8 +248,8 @@ def prompt_rename_target(old_name):
         if new == old_name:
             print("  that's the same name; pick a different one")
             continue
-        if session_path(new).exists():
-            print(f"  a session file for '{new}' already exists; pick another")
+        if session_path(new).exists() or sessionlog_path(new).exists():
+            print(f"  files for '{new}' already exist; pick another")
             continue
         return new
 
@@ -268,16 +317,8 @@ def cmd_new(args):
                 target = prompt_rename_target(name)
                 if not target:
                     return
-                # Move the old file to the chosen name, preserving its
-                # created/description (and updating its own name field).
-                try:
-                    old = load_session(path)
-                    write_session(target, old.get("created") or now_local(),
-                                  old.get("description") or "")
-                    path.unlink()
-                except Exception:
-                    path.rename(session_path(target))  # fallback: plain rename
-                print(f"  (old file kept as '{target}')")
+                rename_session(name, target)  # moves .session and .sessionlog
+                print(f"  (old files kept as '{target}')")
                 write_session(name, now_local(), description)
                 create_and_attach(name)
 
@@ -310,6 +351,22 @@ def cmd_edit(args):
             c = choose("  (e) re-edit   (i) ignore: ", "ei")
             if c == "i":
                 return
+
+
+def cmd_log(args):
+    require("tmux")
+    if not in_tmux():
+        die("`tmgr log` can only be used inside a tmux session")
+    name = current_session()
+    if not name:
+        die("could not determine the current tmux session name")
+    text = " ".join(args.text).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not text:
+        die("nothing to log (give text as arguments or pipe it on stdin)")
+    append_log(name, text)
+    print(f"logged to {sessionlog_path(name)}")
 
 
 def cmd_a(args):
@@ -397,6 +454,12 @@ def cmd_preview(args):
         return
     print(f"  created  : {fmt_dt(data.get('created'))}")
     print(f"  file     : {p}")
+    log = sessionlog_path(name)
+    if log.exists():
+        entries = [ln for ln in log.read_text().splitlines() if ln.strip()]
+        n = len(entries)
+        last = f" — last: {entries[-1]}" if entries else ""
+        print(f"  log      : {n} entr{'y' if n == 1 else 'ies'}{last}")
     print()
     desc = (data.get("description") or "").strip()
     print(desc if desc else "(no description)")
@@ -431,7 +494,7 @@ def cmd_ls(args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(prog="tmgr", description="A small tmux session manager.")
-    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,ls}")
+    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,log,ls}")
 
     pn = sub.add_parser("new", help="create + attach to a tracked session")
     pn.add_argument("name")
@@ -444,6 +507,10 @@ def build_parser():
 
     pa = sub.add_parser("a", help="fuzzy-pick a running session and attach")
     pa.set_defaults(func=cmd_a)
+
+    pg = sub.add_parser("log", help="append text to the current session's log (inside tmux)")
+    pg.add_argument("text", nargs="*", help="text to append (or pipe via stdin)")
+    pg.set_defaults(func=cmd_log)
 
     pl = sub.add_parser("ls", help="list tracked sessions and run state")
     pl.set_defaults(func=cmd_ls)

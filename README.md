@@ -7,7 +7,7 @@ directory with its own `README.md`.
 
 | Tool | Description |
 | --- | --- |
-| [`tmgr`](tmgr/) | A small tmux session manager: fuzzy-switch between sessions with `fzf`, and track each one with a `.session` file (creation time + description). |
+| [`tmgr`](tmgr/) | A small tmux session manager: fuzzy-switch between sessions with `fzf`, and track each one with a `.session` file (creation time + description) and an optional `.sessionlog`. |
 
 ## Layout
 

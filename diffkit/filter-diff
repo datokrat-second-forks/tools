@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""filter-diff - keep or drop changed lines of a diffkit diff by pattern.
+
+Reads a diffkit JSON document on stdin, matches PATTERN against changed
+(added/removed) lines, and writes the filtered document to stdout. Hunks left
+with no changes are dropped, as are files that had changes but no longer do.
+
+Matching follows grep conventions:
+    * by default, lines that MATCH are kept (like `grep`);
+    * `--exclude` / `-v` inverts that, dropping the matches (like `grep -v`);
+    * PATTERN is a regular expression unless `-F` is given;
+    * `-x` requires the match to span the whole line.
+
+Example (hide the boring repeated insertions, keep everything else):
+    structured-diff main feature \\
+        | filter-diff --exclude --trim-whitespace "lorem ipsum" \\
+        | render-diff out.html
+"""
+
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _diffcommon as dc  # noqa: E402
+
+PROG = "filter-diff"
+
+
+def build_matcher(args):
+    """Return a predicate matches(text) -> bool for a single line's content."""
+    pattern = args.pattern
+    trim = args.trim_whitespace
+    ignore = args.ignore_case
+
+    if args.fixed_strings:
+        needle = pattern.lower() if ignore else pattern
+
+        def matches(text):
+            s = text.strip() if trim else text
+            if ignore:
+                s = s.lower()
+            return s == needle if args.line_regexp else needle in s
+    else:
+        flags = re.IGNORECASE if ignore else 0
+        try:
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            dc.die(PROG, f"invalid regex {pattern!r}: {e}")
+        probe = rx.fullmatch if args.line_regexp else rx.search
+
+        def matches(text):
+            s = text.strip() if trim else text
+            return probe(s) is not None
+
+    return matches
+
+
+def filter_lines(lines, matches, sides, keep_matching):
+    """Filter changed lines; context lines are always retained."""
+    out = []
+    for ln in lines:
+        kind = ln["kind"]
+        considered = (kind == "add" and "add" in sides) or \
+                     (kind == "del" and "del" in sides)
+        if not considered:
+            out.append(ln)
+            continue
+        hit = matches(ln["text"])
+        if hit == keep_matching:        # keep when (match == include-mode)
+            out.append(ln)
+    return out
+
+
+def recount(hunk):
+    """Recompute the @@ line counts from the lines actually kept."""
+    old = sum(1 for ln in hunk["lines"] if ln["kind"] in ("context", "del"))
+    new = sum(1 for ln in hunk["lines"] if ln["kind"] in ("context", "add"))
+    hunk["old_count"], hunk["new_count"] = old, new
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("pattern", help="pattern matched against changed lines")
+    p.add_argument("-v", "--exclude", action="store_true",
+                   help="drop matching lines instead of keeping them")
+    p.add_argument("-F", "--fixed-strings", action="store_true",
+                   help="treat PATTERN as a literal string, not a regex")
+    p.add_argument("-x", "--line-regexp", action="store_true",
+                   help="require the match to cover the whole line")
+    p.add_argument("-i", "--ignore-case", action="store_true",
+                   help="case-insensitive matching")
+    p.add_argument("--trim-whitespace", action="store_true",
+                   help="strip leading/trailing whitespace before matching")
+    p.add_argument("--side", choices=("both", "added", "removed"), default="both",
+                   help="which changed lines to test (default: both)")
+    p.add_argument("--keep-empty-files", action="store_true",
+                   help="keep files even if filtering removed all their changes")
+    p.add_argument("--pretty", action="store_true",
+                   help="indent the JSON output (default: compact)")
+    args = p.parse_args(argv)
+
+    matches = build_matcher(args)
+    sides = {"both": {"add", "del"}, "added": {"add"}, "removed": {"del"}}[args.side]
+    keep_matching = not args.exclude
+
+    doc = dc.read_doc(PROG)
+    kept_files = []
+    for f in doc.get("files", []):
+        had_hunks = bool(f["hunks"])
+        new_hunks = []
+        for h in f["hunks"]:
+            h["lines"] = filter_lines(h["lines"], matches, sides, keep_matching)
+            if any(ln["kind"] in ("add", "del") for ln in h["lines"]):
+                recount(h)
+                new_hunks.append(h)
+        f["hunks"] = new_hunks
+        # Drop a file only if filtering emptied it; keep structural-only changes
+        # (renames, mode changes) that never had hunks to begin with.
+        if had_hunks and not new_hunks and not args.keep_empty_files:
+            continue
+        kept_files.append(f)
+
+    doc["files"] = kept_files
+    dc.write_doc(doc, pretty=args.pretty)
+
+
+if __name__ == "__main__":
+    main()

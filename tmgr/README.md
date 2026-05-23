@@ -29,6 +29,7 @@ Requirements:
 | `tmgr new <name> [-m DESC]` | Create a tracked session and attach to it. |
 | `tmgr edit <name>` | Open `<name>.session` in `$EDITOR` (default `vim`). |
 | `tmgr a` | Fuzzy-pick a **running** session and attach/switch to it. |
+| `tmgr log [text]` | Append `text` to the **current** session's log (must be run inside tmux). |
 | `tmgr ls` | List tracked sessions plus their run state. |
 
 Session names must match `^[A-Za-z0-9][A-Za-z0-9-]*$` (letters, digits and `-`,
@@ -48,7 +49,8 @@ starting alphanumeric — which also keeps tmux happy, since it forbids `.`/`:`)
   - `(r)` reset the file (fresh timestamp/description), start a new session
   - `(o)` keep the old file, choose a different name for the new session
   - `(n)` keep the new session under this name; rename the old file to a name
-    **you choose** (its created time and description are preserved)
+    **you choose** (its created time, description **and `.sessionlog`** are
+    preserved/moved with it)
 
 ### `tmgr a`
 
@@ -59,6 +61,21 @@ plain `tmux new` appear too, marked *untracked*.
 
 If you're **inside** tmux, `tmgr a` and `tmgr new` use `switch-client` instead
 of `attach` (you can't nest `tmux attach`).
+
+### `tmgr log [text]`
+
+Appends a timestamped entry to `~/.tools/tmgr/<current-session>.sessionlog`.
+It only works **inside** a tmux session — the session name is read from the
+current pane (via `tmux display-message`), so you don't pass it explicitly.
+
+```sh
+tmgr log fixed the off-by-one in the lexer
+echo "longer note from a script" | tmgr log      # text can come from stdin
+```
+
+The log doesn't need a `.session` file — you can log from an untracked session
+too. Entries look like `[2026-05-23 17:20] fixed the off-by-one in the lexer`,
+and `tmgr a`'s preview shows the entry count and most recent line.
 
 ## The `.session` file
 
@@ -74,3 +91,7 @@ Remember to run the integration suite before merging.
 `tmgr edit` validates the TOML after you save and offers to re-open it if you
 introduced a syntax error. The file is *not* removed when the tmux session ends —
 that surviving file is what becomes a "remnant" and drives the `new` menu above.
+
+Alongside it, `tmgr log` may create a plain-text `<name>.sessionlog`. Neither
+file is ever auto-deleted; both are kept for future reference, and the `new`
+menu's rename option `(n)` moves them together.

@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""structured-diff - emit a git diff between two revisions as JSON.
+
+Runs `git diff` with stable, parseable options and prints a single JSON
+document (the diffkit schema; see _diffcommon.py) to stdout, ready to be piped
+into `filter-diff` and `render-diff`.
+
+Examples:
+    structured-diff main feature           # diff main..feature
+    structured-diff main..feature          # same, range form
+    structured-diff --cached               # staged changes
+    structured-diff -C /path/to/repo HEAD~3 HEAD
+
+Any positional arguments are passed straight through to `git diff` as its
+revision/pathspec arguments, so the full `git diff` surface is available.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _diffcommon as dc  # noqa: E402
+
+PROG = "structured-diff"
+
+
+def derive_labels(revs):
+    """Best-effort (old, new) labels for the diff header."""
+    positional = [r for r in revs if not r.startswith("-")]
+    if len(positional) == 1:
+        spec = positional[0]
+        for sep in ("...", ".."):
+            if sep in spec:
+                a, b = spec.split(sep, 1)
+                return (a or None, b or None)
+    if len(positional) >= 2:
+        return positional[0], positional[1]
+    if len(positional) == 1:
+        return positional[0], "(working tree)"
+    if "--cached" in revs or "--staged" in revs:
+        return "HEAD", "(index)"
+    return "HEAD", "(working tree)"
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-C", "--directory", metavar="DIR", default=".",
+                   help="run git in DIR (default: current directory)")
+    p.add_argument("-U", "--unified", type=int, default=3, metavar="N",
+                   help="lines of context per hunk (default: 3)")
+    p.add_argument("--no-renames", action="store_true",
+                   help="disable rename detection (default: detect renames)")
+    p.add_argument("--pretty", action="store_true",
+                   help="indent the JSON output (default: compact)")
+    p.add_argument("revs", nargs=argparse.REMAINDER,
+                   help="revisions / pathspecs passed through to `git diff`")
+    args = p.parse_args(argv)
+
+    revs = list(args.revs)
+    if revs and revs[0] == "--":
+        revs = revs[1:]
+
+    cmd = ["git", "-C", args.directory, "-c", "core.quotepath=false",
+           "diff", "--no-color", f"-U{args.unified}",
+           "-M" if not args.no_renames else "--no-renames", *revs]
+
+    try:
+        res = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        dc.die(PROG, "`git` not found on PATH")
+    if res.returncode != 0:
+        dc.die(PROG, "git diff failed:\n" + res.stderr.rstrip())
+
+    old, new = derive_labels(revs)
+    doc = {"schema": dc.SCHEMA, "old": old, "new": new,
+           "files": dc.parse_git_diff(res.stdout)}
+    dc.write_doc(doc, pretty=args.pretty)
+
+
+if __name__ == "__main__":
+    main()
