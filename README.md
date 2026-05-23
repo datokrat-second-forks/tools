@@ -3,6 +3,8 @@
 A personal collection of small command-line tools. Each tool lives in its own
 directory with its own `README.md`.
 
+Note: I'm using these inside a heavily restrained sandbox, and they were developed using an LLM. Use at your own risk.
+
 ## Tools
 
 | Tool | Description |
