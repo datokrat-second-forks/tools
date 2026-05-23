@@ -10,7 +10,15 @@ It's a single self-contained Python 3.11+ script — no third-party packages.
 
 ## Install
 
-The script lives at `tmgr/tmgr` in this repo. Symlink it onto your `PATH`:
+Run the bundled script, which adds this directory to your `PATH` via `~/.bashrc`
+(idempotent — it won't add a duplicate line if already present):
+
+```sh
+./install.sh
+source ~/.bashrc   # or open a new shell
+```
+
+Or symlink the script onto your `PATH` yourself:
 
 ```sh
 ln -s "$PWD/tmgr/tmgr" ~/.local/bin/tmgr   # run from the repo root
