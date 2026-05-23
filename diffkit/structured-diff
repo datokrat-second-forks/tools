@@ -28,17 +28,17 @@ PROG = "structured-diff"
 
 def derive_labels(revs):
     """Best-effort (old, new) labels for the diff header."""
-    positional = [r for r in revs if not r.startswith("-")]
-    if len(positional) == 1:
-        spec = positional[0]
+    if "--" in revs:                       # drop pathspecs; keep only revs
+        revs = revs[:revs.index("--")]
+    pos = [r for r in revs if not r.startswith("-")]
+    if len(pos) >= 2:
+        return pos[0], pos[1]
+    if len(pos) == 1:
         for sep in ("...", ".."):
-            if sep in spec:
-                a, b = spec.split(sep, 1)
+            if sep in pos[0]:
+                a, b = pos[0].split(sep, 1)
                 return (a or None, b or None)
-    if len(positional) >= 2:
-        return positional[0], positional[1]
-    if len(positional) == 1:
-        return positional[0], "(working tree)"
+        return pos[0], "(working tree)"
     if "--cached" in revs or "--staged" in revs:
         return "HEAD", "(index)"
     return "HEAD", "(working tree)"
@@ -55,13 +55,10 @@ def main(argv=None):
                    help="disable rename detection (default: detect renames)")
     p.add_argument("--pretty", action="store_true",
                    help="indent the JSON output (default: compact)")
-    p.add_argument("revs", nargs=argparse.REMAINDER,
-                   help="revisions / pathspecs passed through to `git diff`")
-    args = p.parse_args(argv)
-
-    revs = list(args.revs)
-    if revs and revs[0] == "--":
-        revs = revs[1:]
+    p.epilog = ("Anything not recognized above (revisions, pathspecs, git "
+                "options like --cached) is passed through to `git diff`. "
+                "Put diffkit's own options before those.")
+    args, revs = p.parse_known_args(argv)
 
     cmd = ["git", "-C", args.directory, "-c", "core.quotepath=false",
            "diff", "--no-color", f"-U{args.unified}",

@@ -216,8 +216,16 @@ def _parse_file(lines, i):
         hunk, i = _parse_hunk(lines, i)
         f["hunks"].append(hunk)
 
-    if f["old_path"] is None and f["new_path"] is None and not (is_new or is_deleted):
-        f["old_path"], f["new_path"] = _split_diff_git(header)
+    # Recover paths from the `diff --git` line when the body lacked ---/+++
+    # lines (e.g. binary or mode-only changes), honouring add/delete semantics.
+    if f["old_path"] is None and f["new_path"] is None:
+        op, np = _split_diff_git(header)
+        if is_new:
+            f["new_path"] = np
+        elif is_deleted:
+            f["old_path"] = op
+        else:
+            f["old_path"], f["new_path"] = op, np
 
     if is_rename:
         f["status"] = "renamed"

@@ -8,6 +8,7 @@ directory with its own `README.md`.
 | Tool | Description |
 | --- | --- |
 | [`tmgr`](tmgr/) | A small tmux session manager: fuzzy-switch between sessions with `fzf`, and track each one with a `.session` file (creation time + description) and an optional `.sessionlog`. |
+| [`diffkit`](diffkit/) | Three composable tools for Git diffs: `structured-diff` emits a diff as JSON, `filter-diff` keeps/drops changed lines by pattern, and `render-diff` turns the result into a unified-view HTML page. |
 
 ## Layout
 

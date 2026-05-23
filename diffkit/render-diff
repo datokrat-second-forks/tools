@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""render-diff - render a diffkit diff (from stdin) into a unified HTML page.
+
+Reads a diffkit JSON document on stdin and writes a self-contained HTML file
+(embedded CSS, no external assets) showing a unified, GitHub-style diff.
+
+    structured-diff main feature | render-diff out.html
+    structured-diff main feature | render-diff           # HTML to stdout
+"""
+
+import argparse
+import html
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _diffcommon as dc  # noqa: E402
+
+PROG = "render-diff"
+
+CSS = """
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
+       background: #f6f8fa; color: #1f2328; }
+header.page { padding: 16px 24px; border-bottom: 1px solid #d0d7de;
+              background: #fff; position: sticky; top: 0; z-index: 5; }
+header.page h1 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+header.page .meta { color: #57606a; font-size: 13px; }
+.add-stat { color: #1a7f37; font-weight: 600; }
+.del-stat { color: #cf222e; font-weight: 600; }
+main { padding: 16px 24px; }
+.file { border: 1px solid #d0d7de; border-radius: 6px; margin-bottom: 16px;
+        background: #fff; overflow: hidden; }
+.file > summary { list-style: none; cursor: pointer; padding: 8px 12px;
+                  background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+                  display: flex; align-items: center; gap: 8px;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                  font-size: 13px; }
+.file > summary::-webkit-details-marker { display: none; }
+.file > summary::before { content: "\\25be"; color: #57606a; }
+.file:not([open]) > summary::before { content: "\\25b8"; }
+.path { font-weight: 600; word-break: break-all; }
+.path .old { color: #57606a; font-weight: 400; }
+.badge { font-family: -apple-system, sans-serif; font-size: 11px;
+         font-weight: 600; padding: 1px 7px; border-radius: 999px;
+         border: 1px solid transparent; white-space: nowrap; }
+.b-added    { color: #1a7f37; background: #dafbe1; }
+.b-deleted  { color: #cf222e; background: #ffebe9; }
+.b-modified { color: #57606a; background: #eaeef2; }
+.b-renamed  { color: #0969da; background: #ddf4ff; }
+.b-copied   { color: #0969da; background: #ddf4ff; }
+.b-mode     { color: #57606a; background: #eaeef2; }
+.note { color: #57606a; font-style: italic; padding: 10px 12px; }
+table.diff { width: 100%; border-collapse: collapse;
+             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+             font-size: 12.5px; tab-size: 4; }
+table.diff td { padding: 0 8px; vertical-align: top; white-space: pre-wrap;
+                word-break: break-all; }
+td.ln { width: 1%; min-width: 40px; text-align: right; color: #6e7781;
+        background: #f6f8fa; border-right: 1px solid #eaeef2; user-select: none;
+        white-space: nowrap; }
+td.sign { width: 1%; text-align: center; user-select: none; color: #6e7781; }
+tr.add td { background: #e6ffec; }
+tr.add td.ln { background: #ccffd8; }
+tr.del td { background: #ffebe9; }
+tr.del td.ln { background: #ffd7d5; }
+tr.hunk td { background: #ddf4ff; color: #57606a; padding: 4px 8px; }
+.nonl { color: #cf222e; font-style: italic; }
+""".strip()
+
+
+def esc(s):
+    return html.escape(s, quote=False)
+
+
+def display_path(f):
+    op, np = f["old_path"], f["new_path"]
+    if f["status"] in ("renamed", "copied") and op and np and op != np:
+        return f'<span class="old">{esc(op)}</span> &rarr; {esc(np)}'
+    return esc(np or op or "?")
+
+
+def render_lines(lines, out):
+    for ln in lines:
+        kind = ln["kind"]
+        cls = {"add": "add", "del": "del", "context": "ctx"}[kind]
+        sign = {"add": "+", "del": "-", "context": ""}[kind]
+        old = "" if ln["old_lineno"] is None else ln["old_lineno"]
+        new = "" if ln["new_lineno"] is None else ln["new_lineno"]
+        text = esc(ln["text"])
+        if ln.get("no_newline"):
+            text += '<span class="nonl"> \\ No newline at end of file</span>'
+        out.append(
+            f'<tr class="{cls}">'
+            f'<td class="ln">{old}</td><td class="ln">{new}</td>'
+            f'<td class="sign">{sign}</td><td>{text}</td></tr>'
+        )
+
+
+def render_file(f, out):
+    badge = f'<span class="badge b-{f["status"]}">{f["status"]}</span>'
+    out.append('<details class="file" open>')
+    out.append(f'<summary>{badge}<span class="path">{display_path(f)}</span></summary>')
+
+    if f["status"] == "mode" and f["old_mode"] and f["new_mode"]:
+        out.append(f'<div class="note">mode changed {esc(f["old_mode"])} '
+                   f'&rarr; {esc(f["new_mode"])}</div>')
+    if f["binary"]:
+        out.append('<div class="note">Binary file — content not shown.</div>')
+    if not f["hunks"] and not f["binary"] and f["status"] != "mode":
+        out.append('<div class="note">No textual changes.</div>')
+
+    if f["hunks"]:
+        out.append('<table class="diff"><tbody>')
+        for h in f["hunks"]:
+            head = (f'@@ -{h["old_start"]},{h["old_count"]} '
+                    f'+{h["new_start"]},{h["new_count"]} @@')
+            if h["section"]:
+                head += " " + h["section"]
+            out.append(f'<tr class="hunk"><td colspan="4">{esc(head)}</td></tr>')
+            render_lines(h["lines"], out)
+        out.append('</tbody></table>')
+    out.append('</details>')
+
+
+def render(doc):
+    n_files, adds, dels = dc.count_changes(doc)
+    old = esc(str(doc.get("old") or "old"))
+    new = esc(str(doc.get("new") or "new"))
+    out = ["<!doctype html>", '<html lang="en"><head>',
+           '<meta charset="utf-8">',
+           '<meta name="viewport" content="width=device-width, initial-scale=1">',
+           f"<title>diff: {old} &rarr; {new}</title>",
+           f"<style>{CSS}</style>", "</head><body>"]
+    out.append('<header class="page">')
+    out.append(f"<h1>{old} &rarr; {new}</h1>")
+    fw = f"{n_files} file" + ("" if n_files == 1 else "s")
+    out.append(f'<div class="meta">{fw} changed, '
+               f'<span class="add-stat">+{adds}</span> '
+               f'<span class="del-stat">-{dels}</span></div>')
+    out.append('</header><main>')
+    if not doc.get("files"):
+        out.append('<div class="note">No changes.</div>')
+    for f in doc["files"]:
+        render_file(f, out)
+    out.append('</main></body></html>')
+    return "\n".join(out) + "\n"
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("output", nargs="?",
+                   help="HTML file to write (default: stdout)")
+    p.add_argument("-o", "--output", dest="output_opt", metavar="FILE",
+                   help="HTML file to write (same as the positional argument)")
+    args = p.parse_args(argv)
+
+    doc = dc.read_doc(PROG)
+    page = render(doc)
+
+    target = args.output_opt or args.output
+    if target:
+        try:
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write(page)
+        except OSError as e:
+            dc.die(PROG, f"cannot write {target}: {e}")
+        n_files, adds, dels = dc.count_changes(doc)
+        print(f"{PROG}: wrote {target} ({n_files} files, +{adds} -{dels})",
+              file=sys.stderr)
+    else:
+        sys.stdout.write(page)
+
+
+if __name__ == "__main__":
+    main()
