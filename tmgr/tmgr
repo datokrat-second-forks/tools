@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""tmgr - a small tmux session manager.
+
+Tracks tmux sessions with a `.session` file under ~/.tools/tmgr/, holding a
+creation timestamp and an optional (possibly multi-line) description in TOML.
+
+Commands:
+    tmgr new <name> [-m DESC]   create + attach to a session (tracks it)
+    tmgr edit <name>            edit a session's .session file in $EDITOR/vim
+    tmgr a                      fuzzy-pick a running session (fzf) and attach
+    tmgr ls                     list tracked sessions and their run state
+
+See README.md for details.
+"""
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+from datetime import datetime
+from pathlib import Path
+
+TMGR_DIR = Path.home() / ".tools" / "tmgr"
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")  # first char alnum, then alnum/dash
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def die(msg, code=1):
+    print(f"tmgr: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def require(cmd):
+    if shutil.which(cmd) is None:
+        die(f"required command '{cmd}' not found on PATH")
+
+
+def valid_name(name):
+    return bool(NAME_RE.fullmatch(name))
+
+
+def session_path(name):
+    return TMGR_DIR / f"{name}.session"
+
+
+def now_local():
+    return datetime.now().astimezone().replace(microsecond=0)
+
+
+def in_tmux():
+    return bool(os.environ.get("TMUX"))
+
+
+def fmt_dt(value):
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value) if value else "?"
+
+
+def first_line(text):
+    text = (text or "").strip()
+    if not text:
+        return ""
+    line = text.splitlines()[0]
+    return line if len(text.splitlines()) == 1 else line + " …"
+
+
+# --------------------------------------------------------------------------- #
+# TOML read/write (hand-rolled writer; tomllib for reading)
+# --------------------------------------------------------------------------- #
+def _escape_multiline(s):
+    # For a TOML multi-line basic string ("""..."""). Backslashes must be
+    # doubled; a literal triple-quote would close the string, so escape it.
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"""', '\\"\\"\\"')
+    return s
+
+
+def dump_session(name, created, description):
+    out = [f'name = "{name}"', f"created = {created.isoformat()}"]
+    if description:
+        out.append('description = """\n' + _escape_multiline(description) + '\n"""')
+    else:
+        out.append('description = ""')
+    return "\n".join(out) + "\n"
+
+
+def write_session(name, created, description):
+    TMGR_DIR.mkdir(parents=True, exist_ok=True)
+    session_path(name).write_text(dump_session(name, created, description))
+
+
+def load_session(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+# --------------------------------------------------------------------------- #
+# tmux wrappers
+# --------------------------------------------------------------------------- #
+def tmux(*args, check=False, capture=False):
+    return subprocess.run(
+        ["tmux", *args],
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def session_running(name):
+    # `=name` forces an exact match (no prefix/fnmatch).
+    return tmux("has-session", "-t", f"={name}", capture=True).returncode == 0
+
+
+def running_sessions():
+    res = tmux("list-sessions", "-F", "#{session_name}", capture=True)
+    if res.returncode != 0:
+        return []
+    return [ln for ln in res.stdout.splitlines() if ln]
+
+
+def session_info(name):
+    # Window/attached counts come from list-sessions (display-message leaves
+    # these format vars empty when no client is attached). Name is placed last
+    # so sessions whose names contain spaces still parse with maxsplit.
+    res = tmux(
+        "list-sessions",
+        "-F", "#{session_windows} #{session_attached} #{session_name}",
+        capture=True,
+    )
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and parts[2] == name:
+            return {"windows": parts[0], "attached": parts[1]}
+    return None
+
+
+def attach(name):
+    """Attach to (or, inside tmux, switch to) an existing session, then exit."""
+    if in_tmux():
+        tmux("switch-client", "-t", f"={name}")
+        sys.exit(0)
+    os.execvp("tmux", ["tmux", "attach", "-t", f"={name}"])
+
+
+def create_and_attach(name):
+    """Create a new session named `name` and attach/switch to it, then exit."""
+    if in_tmux():
+        tmux("new-session", "-d", "-s", name, check=True)
+        tmux("switch-client", "-t", f"={name}")
+        sys.exit(0)
+    os.execvp("tmux", ["tmux", "new-session", "-s", name])
+
+
+# --------------------------------------------------------------------------- #
+# Interactive prompts
+# --------------------------------------------------------------------------- #
+def choose(prompt, valid):
+    """Read a single-letter choice from the user; loops until one is valid."""
+    valid = {c.lower() for c in valid}
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except EOFError:
+            return "q"
+        if ans and ans[0] in valid:
+            return ans[0]
+        print(f"  please answer one of: {', '.join(sorted(valid))}")
+
+
+def prompt_name(message="new session name: "):
+    while True:
+        try:
+            name = input(message).strip()
+        except EOFError:
+            return None
+        if not name:
+            return None
+        if valid_name(name):
+            return name
+        print("  invalid name (use letters, digits and '-', starting alphanumeric)")
+
+
+def prompt_rename_target(old_name):
+    """Ask what to rename the old session file to. Returns a free name or None."""
+    while True:
+        new = prompt_name(f"rename old '{old_name}' file to (blank to cancel): ")
+        if new is None:
+            return None
+        if new == old_name:
+            print("  that's the same name; pick a different one")
+            continue
+        if session_path(new).exists():
+            print(f"  a session file for '{new}' already exists; pick another")
+            continue
+        return new
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_new(args):
+    require("tmux")
+    name = args.name
+    description = args.description or ""
+
+    while True:
+        if not valid_name(name):
+            die(f"invalid session name '{name}' "
+                "(use letters, digits and '-', starting alphanumeric)")
+
+        path = session_path(name)
+        running = session_running(name)
+        exists = path.exists()
+
+        # 1) A live session already owns this name.
+        if running:
+            print(f"A tmux session named '{name}' is already running.")
+            print("  (a) attach to it   (d) different name   (q) quit")
+            c = choose("choice [a/d/q]: ", "adq")
+            if c == "q":
+                return
+            if c == "d":
+                new = prompt_name()
+                if not new:
+                    return
+                name = new
+                continue
+            # attach: track it if it wasn't already
+            if not exists:
+                write_session(name, now_local(), "")
+                print(f"  (created tracking file {path})")
+            attach(name)
+
+        # 2) Stale .session file but no live session -> probably a remnant.
+        if exists:
+            print(f"A session file already exists: {path}")
+            print("It is probably a remnant of a session that already terminated.")
+            print("  (q) quit")
+            print("  (k) keep the file, start new tmux session")
+            print("  (r) reset the file, start new session")
+            print("  (o) keep old, choose different name")
+            print("  (n) keep new, rename old session file")
+            c = choose("choice [q/k/r/o/n]: ", "qkron")
+            if c == "q":
+                return
+            if c == "k":
+                create_and_attach(name)
+            if c == "r":
+                write_session(name, now_local(), description)
+                create_and_attach(name)
+            if c == "o":
+                new = prompt_name()
+                if not new:
+                    return
+                name = new
+                continue
+            if c == "n":
+                target = prompt_rename_target(name)
+                if not target:
+                    return
+                # Move the old file to the chosen name, preserving its
+                # created/description (and updating its own name field).
+                try:
+                    old = load_session(path)
+                    write_session(target, old.get("created") or now_local(),
+                                  old.get("description") or "")
+                    path.unlink()
+                except Exception:
+                    path.rename(session_path(target))  # fallback: plain rename
+                print(f"  (old file kept as '{target}')")
+                write_session(name, now_local(), description)
+                create_and_attach(name)
+
+        # 3) Clean slate.
+        write_session(name, now_local(), description)
+        create_and_attach(name)
+        return
+
+
+def cmd_edit(args):
+    name = args.name
+    if not valid_name(name):
+        die(f"invalid session name '{name}'")
+    path = session_path(name)
+
+    if not path.exists():
+        c = choose(f"No session file for '{name}'. Create one? [y/n]: ", "yn")
+        if c != "y":
+            return
+        write_session(name, now_local(), "")
+
+    editor = os.environ.get("EDITOR") or "vim"
+    while True:
+        subprocess.run([editor, str(path)])
+        try:
+            load_session(path)
+            return
+        except Exception as e:
+            print(f"tmgr: {path} is no longer valid TOML: {e}", file=sys.stderr)
+            c = choose("  (e) re-edit   (i) ignore: ", "ei")
+            if c == "i":
+                return
+
+
+def cmd_a(args):
+    require("tmux")
+    sessions = running_sessions()
+    if not sessions:
+        print("No running tmux sessions. Start one with: tmgr new <name>")
+        return
+
+    lines = []
+    for s in sessions:
+        desc = ""
+        p = session_path(s)
+        if p.exists():
+            try:
+                desc = first_line(load_session(p).get("description", ""))
+            except Exception:
+                desc = "(unreadable .session)"
+        lines.append(f"{s}\t{desc}")
+
+    choice = pick(lines)
+    if not choice:
+        return
+    name = choice.split("\t", 1)[0]
+    attach(name)
+
+
+def pick(lines):
+    """Pick one of `lines` (tab-separated name<TAB>desc). Returns the line."""
+    if shutil.which("fzf"):
+        self_path = os.path.realpath(sys.argv[0])
+        preview = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(self_path)} _preview {{1}}"
+        )
+        res = subprocess.run(
+            [
+                "fzf",
+                "--delimiter", "\t",
+                "--with-nth", "1,2",
+                "--prompt", "session> ",
+                "--preview", preview,
+                "--preview-window", "right,55%,wrap",
+            ],
+            input="\n".join(lines),
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        if res.returncode != 0:  # 130 == user cancelled
+            return None
+        return res.stdout.strip() or None
+
+    # Fallback when fzf is unavailable.
+    print("(fzf not found - falling back to a numbered list)\n")
+    for i, ln in enumerate(lines, 1):
+        name, _, desc = ln.partition("\t")
+        print(f"  {i:2}. {name}" + (f"  -  {desc}" if desc else ""))
+    try:
+        raw = input("\nselect number (blank to cancel): ").strip()
+    except EOFError:
+        return None
+    if not raw.isdigit() or not (1 <= int(raw) <= len(lines)):
+        return None
+    return lines[int(raw) - 1]
+
+
+def cmd_preview(args):
+    """Hidden: render the fzf preview pane for a session name."""
+    name = args.name
+    print(name)
+    print()
+    info = session_info(name)
+    if info:
+        state = "attached" if info["attached"] not in ("0", "") else "detached"
+        print(f"  status   : running, {state}")
+        print(f"  windows  : {info['windows']}")
+    p = session_path(name)
+    if not p.exists():
+        print("  tracking : untracked (no .session file)")
+        return
+    try:
+        data = load_session(p)
+    except Exception as e:
+        print(f"  file     : {p}")
+        print(f"  WARNING  : invalid TOML ({e})")
+        return
+    print(f"  created  : {fmt_dt(data.get('created'))}")
+    print(f"  file     : {p}")
+    print()
+    desc = (data.get("description") or "").strip()
+    print(desc if desc else "(no description)")
+
+
+def cmd_ls(args):
+    files = sorted(TMGR_DIR.glob("*.session")) if TMGR_DIR.exists() else []
+    live = set(running_sessions()) if shutil.which("tmux") else set()
+    tracked = set()
+
+    if not files and not live:
+        print("No tracked sessions and no running tmux sessions.")
+        return
+
+    print(f"{'STATE':9} {'NAME':20} DESCRIPTION")
+    for f in files:
+        name = f.name[: -len(".session")]
+        tracked.add(name)
+        state = "running" if name in live else "remnant"
+        desc = ""
+        try:
+            desc = first_line(load_session(f).get("description", ""))
+        except Exception:
+            desc = "(unreadable)"
+        print(f"{state:9} {name:20} {desc}")
+    for name in sorted(live - tracked):
+        print(f"{'running':9} {name:20} (untracked)")
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(prog="tmgr", description="A small tmux session manager.")
+    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,ls}")
+
+    pn = sub.add_parser("new", help="create + attach to a tracked session")
+    pn.add_argument("name")
+    pn.add_argument("-m", "--description", help="initial description text")
+    pn.set_defaults(func=cmd_new)
+
+    pe = sub.add_parser("edit", help="edit a session's .session file")
+    pe.add_argument("name")
+    pe.set_defaults(func=cmd_edit)
+
+    pa = sub.add_parser("a", help="fuzzy-pick a running session and attach")
+    pa.set_defaults(func=cmd_a)
+
+    pl = sub.add_parser("ls", help="list tracked sessions and run state")
+    pl.set_defaults(func=cmd_ls)
+
+    pp = sub.add_parser("_preview")  # hidden helper for fzf
+    pp.add_argument("name")
+    pp.set_defaults(func=cmd_preview)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        sys.exit(2)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
