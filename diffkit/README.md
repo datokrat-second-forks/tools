@@ -5,7 +5,7 @@ machine-filter before reading it:
 
 ```
 structured-diff main feature \
-  | filter-diff --exclude --trim-whitespace "lorem ipsum" \
+  | filter-diff --exclude "lorem ipsum" \
   | render-diff out.html
 ```
 
@@ -76,7 +76,7 @@ Output goes to stdout. Rename detection is on by default; renames appear with
 ## `filter-diff`
 
 ```
-filter-diff [-v] [-F] [-x] [-i] [--trim-whitespace] [--side ...] PATTERN
+filter-diff [-v] [-E] [--substring] [-i] [--no-trim] [--side ...] PATTERN
 ```
 
 Reads a diff document on stdin, tests `PATTERN` against **changed**
@@ -89,26 +89,29 @@ lines to test, so it counts as **not matching** the pattern: it is dropped in
 the default keep-matching mode and kept under `--exclude` — the same disposition
 a non-matching line gets. (`--keep-empty-files` keeps these regardless.)
 
-Matching follows `grep` conventions:
+Matching defaults to a **literal, whole-line** comparison with surrounding
+**whitespace ignored** — paste a line and it matches that line. Opt out of each:
 
 | Option | Meaning |
 | --- | --- |
 | *(default)* | lines that **match** are kept |
 | `-v, --exclude` | invert: drop the matches instead (like `grep -v`) |
-| `-F, --fixed-strings` | treat `PATTERN` as a literal string, not a regex |
-| `-x, --line-regexp` | require the match to span the whole line |
+| `-E, --regexp` | treat `PATTERN` as a regular expression (default: literal string) |
+| `--substring` | match anywhere in the line (default: the whole line must match) |
 | `-i, --ignore-case` | case-insensitive |
-| `--trim-whitespace` | strip leading/trailing whitespace before matching |
+| `--no-trim` | compare the raw line (default: ignore leading/trailing whitespace) |
 | `--side {both,added,removed}` | which changed lines to test (default: both) |
 | `--keep-empty-files` | keep files even after all their changes are removed |
 | `--pretty` | indent the JSON output |
 
-So the headline example — *"hide insertions that are just `lorem ipsum` once
-you ignore surrounding whitespace"* — is:
+So the headline example — *"hide insertions that are just `lorem ipsum`"* (the
+default already ignores surrounding whitespace and matches the whole line) — is:
 
 ```sh
-filter-diff --exclude --trim-whitespace "lorem ipsum"
+filter-diff --exclude "lorem ipsum"
 ```
+
+To match anything that merely *mentions* `lorem ipsum`, add `--substring`.
 
 > Note: filtering removes individual changed lines, so the result is meant for
 > *viewing*, not for `git apply`. `filter-diff` recomputes each hunk's `@@`

@@ -20,9 +20,11 @@ Commands:
     floodgate clear                     remove marks for stdin's changes
     floodgate status                    summarize the active review
 
-The bulk-marking pipeline (filter-diff is from diffkit):
-    floodgate diff | filter-diff -i "TODO" | floodgate reject
-    floodgate diff | filter-diff -F "vendor/"  | floodgate skip   # by content
+The bulk-marking pipeline (filter-diff is from diffkit; it matches a literal,
+whole-line, whitespace-trimmed pattern by default -- add --substring to match
+anywhere in a line):
+    floodgate diff | filter-diff --substring "TODO"   | floodgate reject
+    floodgate diff | filter-diff --substring "vendor/" | floodgate skip
 
 See README.md for details.
 """

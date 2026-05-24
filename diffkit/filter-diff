@@ -5,15 +5,17 @@ Reads a diffkit JSON document on stdin, matches PATTERN against changed
 (added/removed) lines, and writes the filtered document to stdout. Hunks left
 with no changes are dropped, as are files that had changes but no longer do.
 
-Matching follows grep conventions:
-    * by default, lines that MATCH are kept (like `grep`);
-    * `--exclude` / `-v` inverts that, dropping the matches (like `grep -v`);
-    * PATTERN is a regular expression unless `-F` is given;
-    * `-x` requires the match to span the whole line.
+Matching defaults to a literal, whole-line comparison with surrounding
+whitespace ignored -- paste a line and it matches that line:
+    * lines that MATCH are kept; `--exclude` / `-v` drops them instead;
+    * `-E` / `--regexp` treats PATTERN as a regular expression;
+    * `--substring` matches anywhere in the line, not just the whole line;
+    * `--no-trim` compares the raw line, including leading/trailing whitespace;
+    * `-i` / `--ignore-case` is case-insensitive.
 
-Example (hide the boring repeated insertions, keep everything else):
+Example (hide repeated `lorem ipsum` insertions, keep everything else):
     structured-diff main feature \\
-        | filter-diff --exclude --trim-whitespace "lorem ipsum" \\
+        | filter-diff --exclude "lorem ipsum" \\
         | render-diff out.html
 """
 
@@ -29,26 +31,32 @@ PROG = "filter-diff"
 
 
 def build_matcher(args):
-    """Return a predicate matches(text) -> bool for a single line's content."""
-    pattern = args.pattern
-    trim = args.trim_whitespace
-    ignore = args.ignore_case
+    """Return a predicate matches(text) -> bool for one line's content.
 
-    if args.fixed_strings:
-        needle = pattern.lower() if ignore else pattern
+    Defaults: a literal string, matched against the whole line, with leading and
+    trailing whitespace ignored. Opt out with -E/--regexp, --substring, --no-trim.
+    """
+    pattern = args.pattern
+    trim = not args.no_trim
+    ignore = args.ignore_case
+    whole_line = not args.substring
+
+    if not args.regexp:
+        needle = pattern.strip() if trim else pattern
+        needle = needle.lower() if ignore else needle
 
         def matches(text):
             s = text.strip() if trim else text
             if ignore:
                 s = s.lower()
-            return s == needle if args.line_regexp else needle in s
+            return s == needle if whole_line else needle in s
     else:
         flags = re.IGNORECASE if ignore else 0
         try:
             rx = re.compile(pattern, flags)
         except re.error as e:
             dc.die(PROG, f"invalid regex {pattern!r}: {e}")
-        probe = rx.fullmatch if args.line_regexp else rx.search
+        probe = rx.fullmatch if whole_line else rx.search
 
         def matches(text):
             s = text.strip() if trim else text
@@ -86,14 +94,14 @@ def main(argv=None):
     p.add_argument("pattern", help="pattern matched against changed lines")
     p.add_argument("-v", "--exclude", action="store_true",
                    help="drop matching lines instead of keeping them")
-    p.add_argument("-F", "--fixed-strings", action="store_true",
-                   help="treat PATTERN as a literal string, not a regex")
-    p.add_argument("-x", "--line-regexp", action="store_true",
-                   help="require the match to cover the whole line")
+    p.add_argument("-E", "--regexp", action="store_true",
+                   help="treat PATTERN as a regular expression (default: literal string)")
+    p.add_argument("--substring", action="store_true",
+                   help="match anywhere in the line (default: the whole line must match)")
     p.add_argument("-i", "--ignore-case", action="store_true",
                    help="case-insensitive matching")
-    p.add_argument("--trim-whitespace", action="store_true",
-                   help="strip leading/trailing whitespace before matching")
+    p.add_argument("--no-trim", action="store_true",
+                   help="compare the raw line (default: ignore surrounding whitespace)")
     p.add_argument("--side", choices=("both", "added", "removed"), default="both",
                    help="which changed lines to test (default: both)")
     p.add_argument("--keep-empty-files", action="store_true",

@@ -207,104 +207,109 @@ class TestParser(unittest.TestCase):
 
 # --------------------------------------------------------------------------- #
 # filter-diff
+#
+# Defaults: literal string, whole-line, whitespace-trimmed, keep matches.
+# Opt out with -E/--regexp, --substring, --no-trim, -v/--exclude.
 # --------------------------------------------------------------------------- #
 def sample_doc():
-    """a.txt (TODO + clean adds), a rename, and c.txt (one TODO add)."""
+    """a.txt (two adds), a rename, and c.txt (one add) -- for the dropping rules.
+
+    Lines are exact so the default whole-line literal match applies cleanly.
+    """
     return doc(
         file_rec("a.txt", "a.txt", hunks=[hunk([
             line("context", "x", 1, 1),
-            line("add", "has TODO here", None, 2),
-            line("add", "clean line", None, 3),
+            line("add", "DROP", None, 2),
+            line("add", "keep", None, 3),
             line("context", "y", 2, 4),
         ])]),
         file_rec("old.txt", "new.txt", status="renamed", similarity=100),
-        file_rec("c.txt", "c.txt", hunks=[hunk([line("add", "another TODO", None, 1)])]),
+        file_rec("c.txt", "c.txt", hunks=[hunk([line("add", "DROP", None, 1)])]),
     )
 
 
 class TestFilterDiff(unittest.TestCase):
-    def test_keep_matching_drops_clean_lines(self):
-        out = filtered(["-i", "TODO"], sample_doc())
+    # ---- defaults: literal, whole-line, whitespace-trimmed ----
+    def test_whole_line_literal_default(self):
+        out = filtered(["DROP"], sample_doc())
         self.assertEqual(paths(out), {"a.txt", "c.txt"})
         a = next(f for f in out["files"] if f["new_path"] == "a.txt")
-        texts = [ln["text"] for ln in a["hunks"][0]["lines"]]
-        self.assertEqual(texts, ["x", "has TODO here", "y"])  # "clean line" gone
+        self.assertEqual([ln["text"] for ln in a["hunks"][0]["lines"]],
+                         ["x", "DROP", "y"])          # "keep" dropped
 
-    def test_exclude_drops_matching_lines(self):
-        out = filtered(["-v", "-i", "TODO"], sample_doc())
-        # a.txt keeps "clean line"; c.txt emptied -> dropped.
+    def test_exclude(self):
+        out = filtered(["-v", "DROP"], sample_doc())
         a = next(f for f in out["files"] if f["new_path"] == "a.txt")
-        texts = [ln["text"] for ln in a["hunks"][0]["lines"]]
-        self.assertEqual(texts, ["x", "clean line", "y"])
-        self.assertNotIn("c.txt", paths(out))
+        self.assertEqual([ln["text"] for ln in a["hunks"][0]["lines"]],
+                         ["x", "keep", "y"])          # "DROP" dropped
+        self.assertNotIn("c.txt", paths(out))         # its only line was DROP
 
-    # ---- the rename / structural-only semantics ----
-    def test_rename_dropped_when_keeping_matches(self):
-        out = filtered(["-i", "TODO"], sample_doc())
-        self.assertNotIn("new.txt", paths(out))
+    def test_whole_line_rejects_partial(self):
+        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "has DROP here")])]))
+        self.assertEqual(filtered(["DROP"], d)["files"], [])            # not the whole line
+        self.assertEqual(paths(filtered(["--substring", "DROP"], d)), {"f"})
 
-    def test_rename_kept_when_excluding(self):
-        out = filtered(["-v", "-i", "TODO"], sample_doc())
-        self.assertIn("new.txt", paths(out))
+    def test_literal_by_default(self):
+        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "a.b")])]))
+        self.assertEqual(paths(filtered(["a.b"], d)), {"f"})            # literal dot
+        self.assertEqual(filtered(["axb"], d)["files"], [])             # not a regex
+        self.assertEqual(paths(filtered(["-E", "a.b"], d)), {"f"})      # regex dot matches
 
-    def test_rename_kept_with_keep_empty_files(self):
-        out = filtered(["-i", "TODO", "--keep-empty-files"], sample_doc())
-        self.assertIn("new.txt", paths(out))
-
-    def test_rename_dropped_even_if_pattern_unmatched(self):
-        # No content matches; in keep mode the rename still goes.
-        out = filtered(["ZZZ"], sample_doc())
-        self.assertEqual(out["files"], [])
-
-    # ---- matching flavours ----
-    def test_fixed_string_vs_regex(self):
-        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "has TODO here")])]))
-        self.assertEqual(paths(filtered(["TO.O"], d)), {"f"})       # regex matches
-        self.assertEqual(filtered(["-F", "TO.O"], d)["files"], [])  # literal does not
+    def test_regexp(self):
+        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "x abc123 y")])]))
+        self.assertEqual(filtered(["-E", r"\d+"], d)["files"], [])      # fullmatch fails
+        self.assertEqual(paths(filtered(["-E", "--substring", r"\d+"], d)), {"f"})
 
     def test_ignore_case(self):
-        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "a TODO")])]))
-        self.assertEqual(filtered(["todo"], d)["files"], [])     # case-sensitive miss
-        self.assertEqual(paths(filtered(["-i", "todo"], d)), {"f"})
+        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "todo")])]))
+        self.assertEqual(filtered(["TODO"], d)["files"], [])
+        self.assertEqual(paths(filtered(["-i", "TODO"], d)), {"f"})
 
-    def test_line_regexp(self):
-        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "has TODO here")])]))
-        self.assertEqual(filtered(["-x", "TODO"], d)["files"], [])        # not whole line
-        self.assertEqual(paths(filtered(["-x", "has TODO here"], d)), {"f"})
+    def test_trim_on_by_default(self):
+        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "   DROP   ")])]))
+        self.assertEqual(paths(filtered(["DROP"], d)), {"f"})           # whitespace ignored
+        self.assertEqual(filtered(["--no-trim", "DROP"], d)["files"], [])
+        self.assertEqual(paths(filtered(["--no-trim", "   DROP   "], d)), {"f"})
 
     def test_side_selection(self):
-        # Only the chosen side is tested; lines on the other side are untested and
-        # always retained. In exclude mode that means only the tested side's
-        # matching lines get dropped.
-        def texts(args):
+        # Only the chosen side is tested; the other side's lines are retained.
+        def units(args):
             out = filtered(args, doc(file_rec("f", "f", hunks=[hunk([
-                line("del", "del TODO", 1), line("add", "add TODO", None, 1)])])))
-            return [ln["text"] for f in out["files"] for h in f["hunks"]
-                    for ln in h["lines"]]
-        self.assertEqual(texts(["-v", "--side", "removed", "TODO"]), ["add TODO"])
-        self.assertEqual(texts(["-v", "--side", "added", "TODO"]), ["del TODO"])
-        self.assertEqual(texts(["-v", "--side", "both", "TODO"]), [])  # both dropped
-
-    def test_trim_whitespace(self):
-        d = doc(file_rec("f", "f", hunks=[hunk([line("add", "   TODO   ")])]))
-        self.assertEqual(filtered(["-x", "TODO"], d)["files"], [])  # whitespace blocks fullmatch
-        self.assertEqual(paths(filtered(["-x", "--trim-whitespace", "TODO"], d)), {"f"})
+                line("del", "X", 1), line("add", "X", None, 1)])])))
+            return [(ln["kind"], ln["text"]) for f in out["files"]
+                    for h in f["hunks"] for ln in h["lines"]]
+        self.assertEqual(units(["-v", "--side", "removed", "X"]), [("add", "X")])
+        self.assertEqual(units(["-v", "--side", "added", "X"]), [("del", "X")])
+        self.assertEqual(units(["-v", "--side", "both", "X"]), [])      # both dropped
 
     def test_recount_matches_kept_lines(self):
-        out = filtered(["-i", "TODO"], sample_doc())
-        a = next(f for f in out["files"] if f["new_path"] == "a.txt")
-        h = a["hunks"][0]
-        # kept: context x, add "has TODO", context y  ->  old=2 (contexts), new=3
+        out = filtered(["DROP"], sample_doc())
+        h = next(f for f in out["files"] if f["new_path"] == "a.txt")["hunks"][0]
+        # kept: context x, add DROP, context y  ->  old=2 (contexts), new=3
         self.assertEqual((h["old_count"], h["new_count"]), (2, 3))
+
+    # ---- structural-only (rename) disposition: counts as non-matching ----
+    def test_rename_dropped_when_keeping_matches(self):
+        self.assertNotIn("new.txt", paths(filtered(["DROP"], sample_doc())))
+
+    def test_rename_kept_when_excluding(self):
+        self.assertIn("new.txt", paths(filtered(["-v", "DROP"], sample_doc())))
+
+    def test_rename_kept_with_keep_empty_files(self):
+        out = filtered(["DROP", "--keep-empty-files"], sample_doc())
+        self.assertIn("new.txt", paths(out))
+
+    def test_rename_dropped_when_nothing_matches(self):
+        self.assertEqual(filtered(["NOPE"], sample_doc())["files"], [])
 
     # ---- the property floodgate relies on: extra keys survive ----
     def test_extra_keys_pass_through(self):
         d = doc(
             file_rec("a.txt", "a.txt", review_id="FILE1", hunks=[
-                hunk([line("add", "x TODO")], review_id="HUNK1")]),
+                hunk([line("add", "content")], review_id="HUNK1")]),
             file_rec("old", "new", status="renamed", review_id="RENAME1"),
         )
-        out = filtered(["-v", "ZZZ"], d)  # exclude nothing -> everything kept
+        out = filtered(["-v", "NOPE"], d)   # exclude a non-match -> everything kept
         a = next(f for f in out["files"] if f["new_path"] == "a.txt")
         self.assertEqual(a["review_id"], "FILE1")
         self.assertEqual(a["hunks"][0]["review_id"], "HUNK1")
@@ -325,8 +330,8 @@ class TestRenderDiff(unittest.TestCase):
         self.assertIn("<!doctype html>", html.lower())
         self.assertIn("src/a.py", html)
         self.assertIn("b-modified", html)
-        self.assertIn("&lt;script&gt;", html)     # escaped
-        self.assertNotIn("<script>evil", html)     # not raw
+        self.assertIn("&lt;script&gt;", html)      # escaped
+        self.assertNotIn("<script>evil", html)      # not raw
 
     def test_empty_doc(self):
         res = run_tool("render-diff", [], doc())
@@ -382,12 +387,12 @@ class TestStructuredDiff(unittest.TestCase):
         (Path(d) / "a.txt").write_text("keep\n")
         run("add", "a.txt")
         run("commit", "-qm", "init")
-        (Path(d) / "a.txt").write_text("keep\nadd TODO\nadd clean\n")
+        (Path(d) / "a.txt").write_text("keep\nDROP\nstay\n")
         sd = run_tool("structured-diff", ["-C", d], "")
-        out = filtered(["-i", "TODO"], json.loads(sd.stdout))
+        out = filtered(["DROP"], json.loads(sd.stdout))   # default whole-line literal
         texts = [ln["text"] for f in out["files"] for h in f["hunks"]
                  for ln in h["lines"] if ln["kind"] == "add"]
-        self.assertEqual(texts, ["add TODO"])   # "add clean" filtered out
+        self.assertEqual(texts, ["DROP"])   # "stay" filtered out
 
 
 if __name__ == "__main__":

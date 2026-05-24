@@ -8,7 +8,7 @@ through diffkit's `filter-diff`.
 
 ```sh
 floodgate review main feature        # open the diff in your browser
-floodgate diff | filter-diff -i "TODO" | floodgate reject   # bulk-mark
+floodgate diff | filter-diff --substring "TODO" | floodgate reject   # bulk-mark
 floodgate status                     # how much is left to review
 ```
 
@@ -95,9 +95,11 @@ subset, so the marking commands just read the ids off their stdin — no fragile
 re-matching:
 
 ```sh
-floodgate diff | filter-diff -i "TODO"        | floodgate reject   # by content
-floodgate diff | filter-diff -F "console.log" | floodgate skip
-floodgate diff | filter-diff --exclude "lorem ipsum" | floodgate accept
+# filter-diff defaults to a literal, whole-line, whitespace-trimmed match;
+# add --substring to match anywhere in a line.
+floodgate diff | filter-diff --substring "TODO"       | floodgate reject
+floodgate diff | filter-diff --substring "console.log" | floodgate skip
+floodgate diff | filter-diff --exclude "lorem ipsum"  | floodgate accept  # whole line
 ```
 
 Then open `floodgate review` (or refresh the page) to see the marks and review
