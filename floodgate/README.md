@@ -69,13 +69,14 @@ Requirements: `git`, and diffkit's `structured-diff` and `filter-diff` on your
 ### `floodgate review <base> <target>`
 
 ```
-floodgate review [-C DIR] [--two-dot] [-p PORT] [--no-open] BASE TARGET
+floodgate review [-C DIR] [--two-dot] [--host HOST] [-p PORT] [--no-open] BASE TARGET
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `-C, --directory DIR` | git repo to diff (default: cwd) |
 | `--two-dot` | diff `base..target` (the two tips) instead of the default `base...target` (changes on `target` since the merge-base) |
+| `--host HOST` | address to bind (default: `127.0.0.1`; use `0.0.0.0` to reach it from outside the container floodgate runs in) |
 | `-p, --port N` | port to serve on (default: 8765; tries the next few if busy) |
 | `--no-open` | don't open a browser automatically |
 
@@ -83,6 +84,16 @@ By default floodgate uses **three-dot** (`base...target`) semantics — the same
 as a GitHub pull request: it shows what `target` introduces relative to the
 common ancestor, not unrelated changes that landed on `base` since. Use
 `--two-dot` to compare the two branch tips directly.
+
+If floodgate runs **inside a container** and you want to open the diff in a
+browser on the host, bind all interfaces and publish the port:
+
+```sh
+floodgate review main feature --host 0.0.0.0 --no-open    # then browse host:8765
+```
+
+The server has no authentication, so only bind a non-loopback address on a
+trusted network.
 
 Running `review` again for the same pair resumes it (marks are kept). Running it
 for a *different* pair prompts before discarding the existing `.review`.
