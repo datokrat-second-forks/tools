@@ -117,11 +117,20 @@ def main(argv=None):
                 recount(h)
                 new_hunks.append(h)
         f["hunks"] = new_hunks
-        # Drop a file only if filtering emptied it; keep structural-only changes
-        # (renames, mode changes) that never had hunks to begin with.
-        if had_hunks and not new_hunks and not args.keep_empty_files:
-            continue
-        kept_files.append(f)
+
+        if new_hunks:
+            kept_files.append(f)
+        elif had_hunks:
+            # Every changed line was filtered out: drop it unless asked to keep.
+            if args.keep_empty_files:
+                kept_files.append(f)
+        else:
+            # Structural-only change (rename/copy/mode/binary): it has no changed
+            # lines to test against PATTERN, so it counts as *not matching*. A
+            # non-match is dropped when keeping matches (the default) and kept when
+            # excluding them (--exclude) -- so renames follow that same disposition.
+            if not keep_matching or args.keep_empty_files:
+                kept_files.append(f)
 
     doc["files"] = kept_files
     dc.write_doc(doc, pretty=args.pretty)

@@ -82,8 +82,12 @@ filter-diff [-v] [-F] [-x] [-i] [--trim-whitespace] [--side ...] PATTERN
 Reads a diff document on stdin, tests `PATTERN` against **changed**
 (added/removed) lines, and writes the filtered document to stdout. Context
 lines are always retained; a hunk with no remaining changes is dropped, and a
-file that *had* changes but no longer does is dropped too (structural-only
-changes such as renames or mode changes are kept).
+file that *had* changes but no longer does is dropped too.
+
+A structural-only change (a rename, mode change, or binary file) has no changed
+lines to test, so it counts as **not matching** the pattern: it is dropped in
+the default keep-matching mode and kept under `--exclude` — the same disposition
+a non-matching line gets. (`--keep-empty-files` keeps these regardless.)
 
 Matching follows `grep` conventions:
 
@@ -134,3 +138,15 @@ its `@@` line numbers, the section heading, and `lines[]`; each line has a
 `old_lineno`/`new_lineno` it sits at. See the docstring in `_diffcommon.py` for
 the full shape — any tool that emits this schema can feed `filter-diff` and
 `render-diff`.
+
+## Tests
+
+A stdlib `unittest` suite (no third-party packages) covers the parser, the
+`filter-diff` matching/dropping rules, the `render-diff` output, and a couple of
+`structured-diff` integration cases against a throwaway git repo:
+
+```sh
+python3 test_diffkit.py        # or: python3 -m unittest -v
+```
+
+The structured-diff tests are skipped if `git` isn't on the `PATH`.
