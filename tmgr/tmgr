@@ -9,6 +9,8 @@ Commands:
     tmgr edit <name>            edit a session's .session file in $EDITOR/vim
     tmgr a [name]               attach to <name>, or fuzzy-pick one (fzf)
     tmgr rm <name>              delete a non-running session's tracking files
+    tmgr log [text]             append a timestamped log entry (inside tmux)
+    tmgr logs [name]            show a session log (fzf-pick, or pass a name)
     tmgr ls [--all]             list running sessions (--all also shows remnants)
 
 See README.md for details.
