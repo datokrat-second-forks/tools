@@ -47,6 +47,7 @@ PROG = "floodgate"
 REVIEW_FILE = ".review"
 SCHEMA = "floodgate.review/v1"
 STATUSES = ("accepted", "rejected", "skipped")  # plus the implicit "unreviewed"
+ALL_VIEW_STATUSES = (*STATUSES, "unreviewed")
 PIPE = subprocess.PIPE
 
 
@@ -70,6 +71,28 @@ def now_iso():
 
 def esc(s):
     return html.escape(str(s), quote=False)
+
+
+def resolve_visible(only, hide):
+    """Resolve --only / --hide into the set of statuses to show (None = all)."""
+    if only and hide:
+        die("use only one of --only / --hide")
+
+    def parse(spec, flag):
+        names = {p.strip() for p in spec.split(",") if p.strip()}
+        if not names:
+            die(f"{flag}: no statuses given")
+        bad = names - set(ALL_VIEW_STATUSES)
+        if bad:
+            die(f"{flag}: unknown status {', '.join(sorted(bad))} "
+                f"(choose from {', '.join(ALL_VIEW_STATUSES)})")
+        return names
+
+    if only:
+        return parse(only, "--only")
+    if hide:
+        return set(ALL_VIEW_STATUSES) - parse(hide, "--hide")
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -309,6 +332,14 @@ function setUnit(id, st) {
   u.dataset.status = st;
   u.querySelectorAll('button[data-scope="unit"]').forEach(b =>
     b.classList.toggle("active", b.dataset.s === st && st !== "unreviewed"));
+  // When a filter is active, a unit marked into a hidden status drops out of view.
+  if (FLOODGATE_VISIBLE && !FLOODGATE_VISIBLE.includes(st)) u.style.display = "none";
+}
+function refreshFileVisibility() {
+  document.querySelectorAll("details.file").forEach(d => {
+    const anyVisible = [...d.querySelectorAll(".unit")].some(u => u.style.display !== "none");
+    d.style.display = anyVisible ? "" : "none";
+  });
 }
 function rollup(sts) {
   const s = new Set(sts);
@@ -343,6 +374,7 @@ async function mark(ids, status) {
   for (const [id, st] of Object.entries(d.statuses)) setUnit(id, st);
   setCounts(d.counts);
   refreshBadges();
+  if (FLOODGATE_VISIBLE) refreshFileVisibility();
 }
 document.addEventListener("click", e => {
   const b = e.target.closest("button[data-s]");
@@ -399,19 +431,25 @@ def render_lines(lines, out):
         )
 
 
-def render_unit(h, out):
+def _hidden(status, visible):
+    """An inline style attr that hides a unit whose status isn't in `visible`."""
+    return ' style="display:none"' if visible is not None and status not in visible else ""
+
+
+def render_unit(h, out, visible):
     uid, st = h["review_id"], h["review_status"]
     head = f'@@ -{h["old_start"]},{h["old_count"]} +{h["new_start"]},{h["new_count"]} @@'
     if h["section"]:
         head += " " + h["section"]
-    out.append(f'<div class="unit status-{st}" id="u-{uid}" data-id="{uid}" data-status="{st}">')
+    out.append(f'<div class="unit status-{st}" id="u-{uid}" data-id="{uid}" '
+               f'data-status="{st}"{_hidden(st, visible)}>')
     out.append(f'<div class="hunkbar"><span>{esc(head)}</span>{controls(st, "unit")}</div>')
     out.append('<table class="diff"><tbody>')
     render_lines(h["lines"], out)
     out.append("</tbody></table></div>")
 
 
-def render_structural_unit(f, out):
+def render_structural_unit(f, out, visible):
     uid, st = f["review_id"], f["review_status"]
     if f["status"] == "mode" and f.get("old_mode") and f.get("new_mode"):
         note = f'mode changed {esc(f["old_mode"])} &rarr; {esc(f["new_mode"])}'
@@ -422,26 +460,30 @@ def render_structural_unit(f, out):
         note = f'{f["status"]}' + (f' (similarity {sim}%)' if sim is not None else "")
     else:
         note = "No textual changes."
-    out.append(f'<div class="unit status-{st}" id="u-{uid}" data-id="{uid}" data-status="{st}">')
+    out.append(f'<div class="unit status-{st}" id="u-{uid}" data-id="{uid}" '
+               f'data-status="{st}"{_hidden(st, visible)}>')
     out.append(f'<div class="hunkbar"><span class="note">{note}</span>{controls(st, "unit")}</div>')
     out.append("</div>")
 
 
-def render_file(f, out):
+def render_file(f, out, visible):
     roll = f["review_status"]
     badge = f'<span class="badge b-{roll}" data-role="filebadge">{roll}</span>'
-    out.append('<details class="file" open>')
+    # Hide the whole file when every one of its units is hidden by the filter.
+    statuses = [h["review_status"] for h in f["hunks"]] if f.get("hunks") else [f["review_status"]]
+    file_hidden = visible is not None and all(s not in visible for s in statuses)
+    out.append(f'<details class="file" open{" style=\"display:none\"" if file_hidden else ""}>')
     out.append(f'<summary>{badge}<span class="path">{display_path(f)}</span>'
                f'{controls(None, "file")}</summary>')
     if f.get("hunks"):
         for h in f["hunks"]:
-            render_unit(h, out)
+            render_unit(h, out, visible)
     else:
-        render_structural_unit(f, out)
+        render_structural_unit(f, out, visible)
     out.append("</details>")
 
 
-def render_page(doc, review, base, target, moved):
+def render_page(doc, review, base, target, moved, visible=None):
     units = list(iter_units(doc))
     c = tally([u[2] for u in units], review.get("marks", {}))
     out = ["<!doctype html>", '<html lang="en"><head>', '<meta charset="utf-8">',
@@ -457,15 +499,25 @@ def render_page(doc, review, base, target, moved):
                f'<span class="c-skipped">skipped <b id="cnt-skipped">{c["skipped"]}</b></span> &nbsp;·&nbsp; '
                f'<span class="c-unreviewed">unreviewed <b id="cnt-unreviewed">{c["unreviewed"]}</b></span>'
                "</div>")
+    if visible is not None:
+        shown = ", ".join(s for s in ALL_VIEW_STATUSES if s in visible)
+        out.append(f'<div class="meta">showing: {shown}</div>')
     out.append("</header><main>")
     if moved:
         out.append('<div class="banner">⚠ The branches moved since this review '
                    "started — hunks whose content changed reappear as unreviewed.</div>")
     if not doc.get("files"):
         out.append('<div class="note">No changes between these revisions.</div>')
+    elif visible is not None and not any(
+            (h["review_status"] if h is not None else f["review_status"]) in visible
+            for f, h, _ in units):
+        out.append(f'<div class="note">All {c["total"]} entries are hidden by the '
+                   "current filter.</div>")
     for f in doc["files"]:
-        render_file(f, out)
+        render_file(f, out, visible)
     out.append("</main>")
+    vis_js = "null" if visible is None else json.dumps(sorted(visible))
+    out.append(f"<script>const FLOODGATE_VISIBLE = {vis_js};</script>")
     out.append(f"<script>{JS}</script>")
     out.append("</body></html>")
     return "\n".join(out) + "\n"
@@ -481,10 +533,10 @@ def error_page(exc):
 # HTTP server
 # --------------------------------------------------------------------------- #
 class State:
-    def __init__(self, review_path, base, target, mode, repo, review, moved):
+    def __init__(self, review_path, base, target, mode, repo, review, moved, visible=None):
         self.review_path = Path(review_path)
         self.base, self.target, self.mode, self.repo = base, target, mode, repo
-        self.review, self.moved = review, moved
+        self.review, self.moved, self.visible = review, moved, visible
         self.lock = threading.Lock()
         self.id_to_path, self.unit_ids = {}, []
 
@@ -524,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(500, error_page(e))
                     return
                 st.cache_units(doc)
-                page = render_page(doc, st.review, st.base, st.target, st.moved)
+                page = render_page(doc, st.review, st.base, st.target, st.moved, st.visible)
             self._send(200, page)
         elif self.path == "/favicon.ico":
             self._send(204, b"")
@@ -605,6 +657,7 @@ def cmd_review(args):
     repo = args.directory
     base, target = args.base, args.target
     mode = "two-dot" if args.two_dot else "three-dot"
+    visible = resolve_visible(args.only, args.hide)
     base_sha = rev_parse(base, repo)
     target_sha = rev_parse(target, repo)
     mb = merge_base(base, target, repo)
@@ -657,7 +710,7 @@ def cmd_review(args):
     if moved:
         print(f"{PROG}: note — branches moved since the last session; "
               "changed hunks reappear as unreviewed.", flush=True)
-    serve(State(path, base, target, mode, repo, review, moved),
+    serve(State(path, base, target, mode, repo, review, moved, visible),
           args.host, args.port, not args.no_open)
 
 
@@ -735,6 +788,11 @@ def build_parser():
     pr.add_argument("base")
     pr.add_argument("target")
     pr.add_argument("-C", "--directory", default=".", help="git repo dir (default: cwd)")
+    pr.add_argument("--only", metavar="STATUSES",
+                    help="show only these statuses (comma-separated: "
+                         "accepted,rejected,skipped,unreviewed)")
+    pr.add_argument("--hide", metavar="STATUSES",
+                    help="hide these statuses (comma-separated); e.g. --hide accepted")
     pr.add_argument("--two-dot", action="store_true",
                     help="diff base..target (tips) instead of base...target (merge-base)")
     pr.add_argument("--host", default="127.0.0.1",

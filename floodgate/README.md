@@ -69,12 +69,15 @@ Requirements: `git`, and diffkit's `structured-diff` and `filter-diff` on your
 ### `floodgate review <base> <target>`
 
 ```
-floodgate review [-C DIR] [--two-dot] [--host HOST] [-p PORT] [--no-open] BASE TARGET
+floodgate review [-C DIR] [--only STATUSES | --hide STATUSES]
+                 [--two-dot] [--host HOST] [-p PORT] [--no-open] BASE TARGET
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `-C, --directory DIR` | git repo to diff (default: cwd) |
+| `--only STATUSES` | show only entries with these statuses (comma-separated: `accepted,rejected,skipped,unreviewed`) |
+| `--hide STATUSES` | hide entries with these statuses (comma-separated) |
 | `--two-dot` | diff `base..target` (the two tips) instead of the default `base...target` (changes on `target` since the merge-base) |
 | `--host HOST` | address to bind (default: `127.0.0.1`; use `0.0.0.0` to reach it from outside the container floodgate runs in) |
 | `-p, --port N` | port to serve on (default: 8765; tries the next few if busy) |
@@ -84,6 +87,24 @@ By default floodgate uses **three-dot** (`base...target`) semantics — the same
 as a GitHub pull request: it shows what `target` introduces relative to the
 common ancestor, not unrelated changes that landed on `base` since. Use
 `--two-dot` to compare the two branch tips directly.
+
+#### Filtering the view (`--only` / `--hide`)
+
+`--only` and `--hide` restrict which entries the page shows, by review status —
+the counts in the header still reflect the full totals. The unit is the hunk, so
+a file is shown whenever any of its hunks is; a file all of whose hunks are
+filtered out drops away entirely. The two flags are mutually exclusive.
+
+The motivating workflow is *bulk-accept, then focus on the rest*:
+
+```sh
+floodgate diff | filter-diff --substring "vendor/" | floodgate accept
+floodgate review main feature --hide accepted      # only what's left to look at
+```
+
+When a filter is active, marking an entry into a hidden status (e.g. accepting
+something while `--hide accepted`) makes it drop out of view immediately, so the
+list shrinks as you work.
 
 If floodgate runs **inside a container** and you want to open the diff in a
 browser on the host, bind all interfaces and publish the port:
