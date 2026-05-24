@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""floodgate - review the diff between two branches in your browser, with
+persistent accept/reject/skip marks stored in a local .review file.
+
+floodgate is built on diffkit: it shells out to `structured-diff` for the diff
+and reuses `filter-diff` in the bulk-marking pipeline. The review unit is the
+*hunk*; a file shows the roll-up of its hunks (and offers whole-file actions).
+
+State lives in ./.review (JSON), keyed by the two compared commits, so a review
+can be interrupted and resumed. Each hunk carries a content-derived `review_id`;
+if the branch changes that hunk, its id changes and the old mark stops applying,
+so the hunk correctly resurfaces as unreviewed.
+
+Commands:
+    floodgate review <base> <target>   start/resume; serve it in the browser
+    floodgate diff                      emit the active review's diff as JSON
+    floodgate accept                    mark stdin's changes accepted
+    floodgate reject                    mark stdin's changes rejected
+    floodgate skip                      mark stdin's changes skipped
+    floodgate clear                     remove marks for stdin's changes
+    floodgate status                    summarize the active review
+
+The bulk-marking pipeline (filter-diff is from diffkit):
+    floodgate diff | filter-diff -i "TODO" | floodgate reject
+    floodgate diff | filter-diff -F "vendor/"  | floodgate skip   # by content
+
+See README.md for details.
+"""
+
+import argparse
+import hashlib
+import html
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import webbrowser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PROG = "floodgate"
+REVIEW_FILE = ".review"
+SCHEMA = "floodgate.review/v1"
+STATUSES = ("accepted", "rejected", "skipped")  # plus the implicit "unreviewed"
+PIPE = subprocess.PIPE
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def die(msg, code=1):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def require(cmd):
+    if shutil.which(cmd) is None:
+        die(f"required command '{cmd}' not found on PATH "
+            + ("(install diffkit)" if cmd in ("structured-diff", "filter-diff") else ""))
+
+
+def now_iso():
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def esc(s):
+    return html.escape(str(s), quote=False)
+
+
+# --------------------------------------------------------------------------- #
+# git / diff production (built on diffkit's structured-diff)
+# --------------------------------------------------------------------------- #
+def rev_parse(rev, repo="."):
+    res = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{rev}^{{commit}}"],
+                         text=True, stdout=PIPE, stderr=PIPE)
+    if res.returncode != 0:
+        die(f"cannot resolve revision {rev!r}:\n" + res.stderr.rstrip())
+    return res.stdout.strip()
+
+
+def merge_base(a, b, repo="."):
+    res = subprocess.run(["git", "-C", repo, "merge-base", a, b],
+                         text=True, stdout=PIPE, stderr=PIPE)
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def produce(base, target, mode, repo="."):
+    """Run diffkit's structured-diff and return the parsed diff document."""
+    require("structured-diff")
+    spec = [f"{base}...{target}"] if mode == "three-dot" else [base, target]
+    res = subprocess.run(["structured-diff", "-C", repo, *spec],
+                         text=True, stdout=PIPE, stderr=PIPE)
+    if res.returncode != 0:
+        die("structured-diff failed:\n" + res.stderr.rstrip())
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError as e:
+        die(f"structured-diff did not emit JSON: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# review_id + annotation
+# --------------------------------------------------------------------------- #
+def changed_texts(hunk):
+    return [ln["text"] for ln in hunk.get("lines", []) if ln["kind"] in ("add", "del")]
+
+
+def hunk_review_id(path, ordinal, hunk):
+    """Stable id for a hunk: file path + ordinal + the changed-line text.
+
+    Content-derived, so it is identical across re-runs and `-U` changes but
+    changes when the hunk's content changes (then its old mark stops matching).
+    The ordinal disambiguates two hunks with identical changed lines in one file.
+    """
+    h = hashlib.sha1()
+    h.update(path.encode("utf-8", "surrogatepass"))
+    h.update(b"\x00")
+    h.update(str(ordinal).encode())
+    for t in changed_texts(hunk):
+        h.update(b"\x00")
+        h.update(t.encode("utf-8", "surrogatepass"))
+    return h.hexdigest()[:12]
+
+
+def file_unit_id(f):
+    """Id for a file with no hunks (rename / mode / binary) — its own unit."""
+    h = hashlib.sha1()
+    for part in (f.get("old_path") or "", f.get("new_path") or "", f.get("status") or ""):
+        h.update(part.encode("utf-8", "surrogatepass"))
+        h.update(b"\x00")
+    return "f" + h.hexdigest()[:11]
+
+
+def mark_status(marks, uid):
+    m = marks.get(uid)
+    if isinstance(m, dict) and m.get("status") in STATUSES:
+        return m["status"]
+    return "unreviewed"
+
+
+def rollup(statuses):
+    s = set(statuses)
+    if not s or s == {"unreviewed"}:
+        return "unreviewed"
+    if len(s) == 1:
+        return next(iter(s))
+    if "unreviewed" in s:
+        return "partial"
+    return "mixed"
+
+
+def annotate(doc, marks):
+    """Stamp each hunk (and hunkless file) with review_id + review_status."""
+    for f in doc.get("files", []):
+        path = f.get("new_path") or f.get("old_path") or "?"
+        f["review_id"] = file_unit_id(f)        # only used when there are no hunks
+        for ordinal, h in enumerate(f.get("hunks") or []):
+            h["review_id"] = hunk_review_id(path, ordinal, h)
+            h["review_status"] = mark_status(marks, h["review_id"])
+        if f.get("hunks"):
+            f["review_status"] = rollup(h["review_status"] for h in f["hunks"])
+        else:
+            f["review_status"] = mark_status(marks, f["review_id"])
+    return doc
+
+
+def iter_units(doc):
+    """Yield (file, hunk_or_None, review_id) for every reviewable unit."""
+    for f in doc.get("files", []):
+        if f.get("hunks"):
+            for h in f["hunks"]:
+                yield f, h, h["review_id"]
+        else:
+            yield f, None, f["review_id"]
+
+
+def collect_units(doc):
+    """(review_id, path) for every unit in a diff document read from stdin."""
+    out = []
+    for f, h, uid in iter_units(doc):
+        path = f.get("new_path") or f.get("old_path") or "?"
+        if uid:
+            out.append((uid, path))
+    return out
+
+
+def tally(unit_ids, marks):
+    c = {"accepted": 0, "rejected": 0, "skipped": 0, "unreviewed": 0, "total": len(unit_ids)}
+    for uid in unit_ids:
+        c[mark_status(marks, uid)] += 1
+    return c
+
+
+# --------------------------------------------------------------------------- #
+# .review load / save / mutate
+# --------------------------------------------------------------------------- #
+def load_review(path=REVIEW_FILE):
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        die(f"{path} is not valid JSON: {e}")
+
+
+def save_review(path, review):
+    p = Path(path)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(review, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, p)              # atomic within the directory
+
+
+def apply_marks(review, pairs, status):
+    """Set (or, for 'clear', remove) the mark for each (review_id, path)."""
+    marks = review.setdefault("marks", {})
+    for uid, path in pairs:
+        if status == "clear":
+            marks.pop(uid, None)
+        else:
+            marks[uid] = {"status": status, "path": path, "at": now_iso()}
+    review["updated"] = now_iso()
+
+
+# --------------------------------------------------------------------------- #
+# HTML rendering
+# --------------------------------------------------------------------------- #
+CSS = """
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
+       background: #f6f8fa; color: #1f2328; }
+header.page { padding: 16px 24px; border-bottom: 1px solid #d0d7de;
+              background: #fff; position: sticky; top: 0; z-index: 5; }
+header.page h1 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+header.page .meta { color: #57606a; font-size: 13px; }
+.counts b { font-weight: 700; }
+.c-accepted   { color: #1a7f37; }
+.c-rejected   { color: #cf222e; }
+.c-skipped    { color: #8250df; }
+.c-unreviewed { color: #9a6700; }
+main { padding: 16px 24px; }
+.banner { background: #fff8c5; border: 1px solid #d4a72c; color: #633c01;
+          padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; }
+.file { border: 1px solid #d0d7de; border-radius: 6px; margin-bottom: 16px;
+        background: #fff; overflow: hidden; }
+.file > summary { list-style: none; cursor: pointer; padding: 8px 12px;
+                  background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+                  display: flex; align-items: center; gap: 8px;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                  font-size: 13px; }
+.file > summary::-webkit-details-marker { display: none; }
+.path { font-weight: 600; word-break: break-all; }
+.path .old { color: #57606a; font-weight: 400; }
+.badge { font-family: -apple-system, sans-serif; font-size: 11px;
+         font-weight: 600; padding: 1px 7px; border-radius: 999px;
+         border: 1px solid transparent; white-space: nowrap; }
+.b-accepted   { color: #1a7f37; background: #dafbe1; }
+.b-rejected   { color: #cf222e; background: #ffebe9; }
+.b-skipped    { color: #8250df; background: #fbefff; }
+.b-unreviewed { color: #9a6700; background: #fff8c5; }
+.b-partial    { color: #9a6700; background: #fff8c5; }
+.b-mixed      { color: #57606a; background: #eaeef2; }
+.unit { border-top: 1px solid #eaeef2; border-left: 4px solid transparent; }
+.unit:first-of-type { border-top: none; }
+.unit.status-accepted   { border-left-color: #2da44e; }
+.unit.status-rejected   { border-left-color: #cf222e; }
+.unit.status-skipped    { border-left-color: #8250df; }
+.unit.status-unreviewed { border-left-color: #d4a72c; }
+.hunkbar { display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+           background: #f6f8fa; border-bottom: 1px solid #eaeef2; color: #57606a;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           font-size: 12px; }
+.controls { margin-left: auto; display: flex; gap: 4px; }
+.controls button { font: inherit; font-size: 11px; padding: 1px 8px; cursor: pointer;
+                   border: 1px solid #d0d7de; border-radius: 6px; background: #fff;
+                   color: #57606a; }
+.controls button:hover { background: #eef1f4; }
+.controls button.active[data-s="accepted"] { background: #2da44e; color: #fff; border-color: #2da44e; }
+.controls button.active[data-s="rejected"] { background: #cf222e; color: #fff; border-color: #cf222e; }
+.controls button.active[data-s="skipped"]  { background: #8250df; color: #fff; border-color: #8250df; }
+.note { color: #57606a; font-style: italic; }
+table.diff { width: 100%; border-collapse: collapse;
+             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+             font-size: 12.5px; tab-size: 4; }
+table.diff td { padding: 0 8px; vertical-align: top; white-space: pre-wrap;
+                word-break: break-all; }
+td.ln { width: 1%; min-width: 40px; text-align: right; color: #6e7781;
+        background: #f6f8fa; border-right: 1px solid #eaeef2; user-select: none;
+        white-space: nowrap; }
+td.sign { width: 1%; text-align: center; user-select: none; color: #6e7781; }
+tr.add td { background: #e6ffec; }
+tr.add td.ln { background: #ccffd8; }
+tr.del td { background: #ffebe9; }
+tr.del td.ln { background: #ffd7d5; }
+.nonl { color: #cf222e; font-style: italic; }
+""".strip()
+
+JS = """
+function setUnit(id, st) {
+  const u = document.getElementById("u-" + id);
+  if (!u) return;
+  u.className = "unit status-" + st;
+  u.dataset.status = st;
+  u.querySelectorAll('button[data-scope="unit"]').forEach(b =>
+    b.classList.toggle("active", b.dataset.s === st && st !== "unreviewed"));
+}
+function rollup(sts) {
+  const s = new Set(sts);
+  if (s.size === 0 || (s.size === 1 && s.has("unreviewed"))) return "unreviewed";
+  if (s.size === 1) return [...s][0];
+  if (s.has("unreviewed")) return "partial";
+  return "mixed";
+}
+function refreshBadges() {
+  document.querySelectorAll("details.file").forEach(d => {
+    const sts = [...d.querySelectorAll(".unit")].map(u => u.dataset.status);
+    const r = rollup(sts);
+    const b = d.querySelector('[data-role="filebadge"]');
+    if (b) { b.textContent = r; b.className = "badge b-" + r; b.setAttribute("data-role", "filebadge"); }
+  });
+}
+function setCounts(c) {
+  ["accepted", "rejected", "skipped", "unreviewed"].forEach(k => {
+    const e = document.getElementById("cnt-" + k);
+    if (e) e.textContent = c[k];
+  });
+}
+async function mark(ids, status) {
+  let r;
+  try {
+    r = await fetch("/mark", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, status }) });
+  } catch (e) { alert("mark failed: " + e); return; }
+  if (!r.ok) { alert("mark failed: HTTP " + r.status); return; }
+  const d = await r.json();
+  for (const [id, st] of Object.entries(d.statuses)) setUnit(id, st);
+  setCounts(d.counts);
+  refreshBadges();
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("button[data-s]");
+  if (!b) return;
+  e.preventDefault();
+  e.stopPropagation();           // don't toggle the <details> when a file button is clicked
+  let ids;
+  if (b.dataset.scope === "file") {
+    const d = b.closest("details.file");
+    ids = [...d.querySelectorAll(".unit")].map(u => u.dataset.id);
+  } else {
+    ids = [b.closest(".unit").dataset.id];
+  }
+  mark(ids, b.dataset.s);
+});
+""".strip()
+
+
+def display_path(f):
+    op, np = f.get("old_path"), f.get("new_path")
+    if f.get("status") in ("renamed", "copied") and op and np and op != np:
+        return f'<span class="old">{esc(op)}</span> &rarr; {esc(np)}'
+    return esc(np or op or "?")
+
+
+def controls(active, scope):
+    btns = [("accepted", "accept"), ("rejected", "reject"),
+            ("skipped", "skip"), ("clear", "clear")]
+    if scope == "file":
+        btns = [("accepted", "accept all"), ("rejected", "reject all"),
+                ("skipped", "skip all"), ("clear", "clear")]
+    parts = ['<span class="controls">']
+    for s, label in btns:
+        cls = " active" if s == active and active != "unreviewed" else ""
+        parts.append(f'<button data-s="{s}" data-scope="{scope}" class="{cls.strip()}">{label}</button>')
+    parts.append("</span>")
+    return "".join(parts)
+
+
+def render_lines(lines, out):
+    for ln in lines:
+        kind = ln["kind"]
+        cls = {"add": "add", "del": "del", "context": "ctx"}[kind]
+        sign = {"add": "+", "del": "-", "context": ""}[kind]
+        old = "" if ln["old_lineno"] is None else ln["old_lineno"]
+        new = "" if ln["new_lineno"] is None else ln["new_lineno"]
+        text = esc(ln["text"])
+        if ln.get("no_newline"):
+            text += '<span class="nonl"> \\ No newline at end of file</span>'
+        out.append(
+            f'<tr class="{cls}">'
+            f'<td class="ln">{old}</td><td class="ln">{new}</td>'
+            f'<td class="sign">{sign}</td><td>{text}</td></tr>'
+        )
+
+
+def render_unit(h, out):
+    uid, st = h["review_id"], h["review_status"]
+    head = f'@@ -{h["old_start"]},{h["old_count"]} +{h["new_start"]},{h["new_count"]} @@'
+    if h["section"]:
+        head += " " + h["section"]
+    out.append(f'<div class="unit status-{st}" id="u-{uid}" data-id="{uid}" data-status="{st}">')
+    out.append(f'<div class="hunkbar"><span>{esc(head)}</span>{controls(st, "unit")}</div>')
+    out.append('<table class="diff"><tbody>')
+    render_lines(h["lines"], out)
+    out.append("</tbody></table></div>")
+
+
+def render_structural_unit(f, out):
+    uid, st = f["review_id"], f["review_status"]
+    if f["status"] == "mode" and f.get("old_mode") and f.get("new_mode"):
+        note = f'mode changed {esc(f["old_mode"])} &rarr; {esc(f["new_mode"])}'
+    elif f.get("binary"):
+        note = "Binary file — content not shown."
+    elif f["status"] in ("renamed", "copied"):
+        sim = f.get("similarity")
+        note = f'{f["status"]}' + (f' (similarity {sim}%)' if sim is not None else "")
+    else:
+        note = "No textual changes."
+    out.append(f'<div class="unit status-{st}" id="u-{uid}" data-id="{uid}" data-status="{st}">')
+    out.append(f'<div class="hunkbar"><span class="note">{note}</span>{controls(st, "unit")}</div>')
+    out.append("</div>")
+
+
+def render_file(f, out):
+    roll = f["review_status"]
+    badge = f'<span class="badge b-{roll}" data-role="filebadge">{roll}</span>'
+    out.append('<details class="file" open>')
+    out.append(f'<summary>{badge}<span class="path">{display_path(f)}</span>'
+               f'{controls(None, "file")}</summary>')
+    if f.get("hunks"):
+        for h in f["hunks"]:
+            render_unit(h, out)
+    else:
+        render_structural_unit(f, out)
+    out.append("</details>")
+
+
+def render_page(doc, review, base, target, moved):
+    units = list(iter_units(doc))
+    c = tally([u[2] for u in units], review.get("marks", {}))
+    out = ["<!doctype html>", '<html lang="en"><head>', '<meta charset="utf-8">',
+           '<meta name="viewport" content="width=device-width, initial-scale=1">',
+           f"<title>floodgate: {esc(base)} &rarr; {esc(target)}</title>",
+           f"<style>{CSS}</style></head><body>"]
+    out.append('<header class="page">')
+    out.append(f"<h1>{esc(base)} &rarr; {esc(target)}</h1>")
+    out.append('<div class="meta counts">'
+               f'{c["total"]} changes &nbsp;·&nbsp; '
+               f'<span class="c-accepted">accepted <b id="cnt-accepted">{c["accepted"]}</b></span> &nbsp;·&nbsp; '
+               f'<span class="c-rejected">rejected <b id="cnt-rejected">{c["rejected"]}</b></span> &nbsp;·&nbsp; '
+               f'<span class="c-skipped">skipped <b id="cnt-skipped">{c["skipped"]}</b></span> &nbsp;·&nbsp; '
+               f'<span class="c-unreviewed">unreviewed <b id="cnt-unreviewed">{c["unreviewed"]}</b></span>'
+               "</div>")
+    out.append("</header><main>")
+    if moved:
+        out.append('<div class="banner">⚠ The branches moved since this review '
+                   "started — hunks whose content changed reappear as unreviewed.</div>")
+    if not doc.get("files"):
+        out.append('<div class="note">No changes between these revisions.</div>')
+    for f in doc["files"]:
+        render_file(f, out)
+    out.append("</main>")
+    out.append(f"<script>{JS}</script>")
+    out.append("</body></html>")
+    return "\n".join(out) + "\n"
+
+
+def error_page(exc):
+    return ("<!doctype html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+            f"<h1>floodgate error</h1><pre>{esc(exc)}</pre>"
+            "<p>Fix the problem and reload.</p></body>")
+
+
+# --------------------------------------------------------------------------- #
+# HTTP server
+# --------------------------------------------------------------------------- #
+class State:
+    def __init__(self, review_path, base, target, mode, repo, review, moved):
+        self.review_path = Path(review_path)
+        self.base, self.target, self.mode, self.repo = base, target, mode, repo
+        self.review, self.moved = review, moved
+        self.lock = threading.Lock()
+        self.id_to_path, self.unit_ids = {}, []
+
+    def produce_annotated(self):
+        doc = produce(self.base, self.target, self.mode, self.repo)
+        annotate(doc, self.review.get("marks", {}))
+        return doc
+
+    def cache_units(self, doc):
+        self.id_to_path, self.unit_ids = {}, []
+        for f, _h, uid in iter_units(doc):
+            self.unit_ids.append(uid)
+            self.id_to_path[uid] = f.get("new_path") or f.get("old_path") or "?"
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):          # keep the console quiet
+        pass
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        st = self.server.state
+        if self.path in ("/", "/index.html"):
+            with st.lock:
+                # Reload marks so changes made by the CLI pipeline show on refresh.
+                st.review = load_review(st.review_path) or st.review
+                try:
+                    doc = st.produce_annotated()
+                except SystemExit as e:
+                    self._send(500, error_page(e))
+                    return
+                st.cache_units(doc)
+                page = render_page(doc, st.review, st.base, st.target, st.moved)
+            self._send(200, page)
+        elif self.path == "/favicon.ico":
+            self._send(204, b"")
+        else:
+            self._send(404, "not found")
+
+    def do_POST(self):
+        st = self.server.state
+        if self.path != "/mark":
+            self._send(404, "not found")
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            self._send(400, "bad json")
+            return
+        ids = payload.get("ids") or []
+        status = payload.get("status")
+        if status not in (*STATUSES, "clear"):
+            self._send(400, "bad status")
+            return
+        with st.lock:
+            review = load_review(st.review_path) or st.review
+            apply_marks(review, [(i, st.id_to_path.get(i, "")) for i in ids], status)
+            save_review(st.review_path, review)
+            st.review = review
+            res = "unreviewed" if status == "clear" else status
+            body = {"ok": True,
+                    "counts": tally(st.unit_ids, review.get("marks", {})),
+                    "statuses": {i: res for i in ids}}
+        self._send(200, json.dumps(body), "application/json")
+
+
+def serve(state, port, open_browser):
+    httpd = None
+    for p in range(port, port + 20):
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            port = p
+            break
+        except OSError:
+            continue
+    if httpd is None:
+        die(f"no free port in {port}..{port + 19}")
+    httpd.state = state
+    url = f"http://127.0.0.1:{port}/"
+    print(f"{PROG}: serving {url}  (Ctrl-C to stop)", flush=True)
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\n{PROG}: stopped.")
+    finally:
+        httpd.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_review(args):
+    require("git")
+    require("structured-diff")
+    repo = args.directory
+    base, target = args.base, args.target
+    mode = "two-dot" if args.two_dot else "three-dot"
+    base_sha = rev_parse(base, repo)
+    target_sha = rev_parse(target, repo)
+    mb = merge_base(base, target, repo)
+    if mode == "three-dot" and mb is None:
+        die(f"{base} and {target} have no common ancestor; use --two-dot")
+
+    path = Path(REVIEW_FILE)
+    existing = load_review(path)
+    review, moved = None, False
+    if existing:
+        same = (existing.get("base", {}).get("rev") == base
+                and existing.get("target", {}).get("rev") == target
+                and existing.get("mode", "three-dot") == mode)
+        if same:
+            review = existing
+            moved = (review.get("target", {}).get("commit") != target_sha
+                     or (mode == "three-dot" and review.get("merge_base") != mb))
+        else:
+            eb = existing.get("base", {}).get("rev")
+            et = existing.get("target", {}).get("rev")
+            print(f"{PROG}: {path} already holds a review for {eb} → {et} "
+                  f"({existing.get('mode', 'three-dot')}), not {base} → {target} ({mode}).")
+            try:
+                ans = input("Discard it and start a new review? [y/N]: ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans != "y":
+                print(f"{PROG}: keeping the existing review; nothing changed.")
+                return
+
+    if review is None:
+        review = {"schema": SCHEMA, "created": now_iso(), "marks": {}}
+    review["base"] = {"rev": base, "commit": base_sha}
+    review["target"] = {"rev": target, "commit": target_sha}
+    review["merge_base"] = mb
+    review["mode"] = mode
+    review["updated"] = now_iso()
+    save_review(path, review)
+
+    # .review lives in the working directory; nudge to gitignore it so a stray
+    # `git add -A` can't commit it. check-ignore: 0=ignored, 1=not, 128=no repo.
+    if subprocess.run(["git", "check-ignore", "-q", REVIEW_FILE],
+                      stdout=PIPE, stderr=PIPE).returncode == 1:
+        print(f"{PROG}: hint — add '{REVIEW_FILE}' to .gitignore so it isn't committed.",
+              flush=True)
+
+    n = len(review.get("marks", {}))
+    print(f"{PROG}: reviewing {base} → {target} ({mode}); state in {path}"
+          + (f" ({n} existing mark{'s' if n != 1 else ''})" if n else ""), flush=True)
+    if moved:
+        print(f"{PROG}: note — branches moved since the last session; "
+              "changed hunks reappear as unreviewed.", flush=True)
+    serve(State(path, base, target, mode, repo, review, moved),
+          args.port, not args.no_open)
+
+
+def cmd_diff(args):
+    review = load_review()
+    if review is None:
+        die(f"no {REVIEW_FILE} here — run `floodgate review <base> <target>` first")
+    doc = produce(review["base"]["rev"], review["target"]["rev"],
+                  review.get("mode", "three-dot"))
+    annotate(doc, review.get("marks", {}))
+    json.dump(doc, sys.stdout, separators=(",", ":"), ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_mark(args):
+    review = load_review()
+    if review is None:
+        die(f"no {REVIEW_FILE} here — run `floodgate review …` first")
+    data = sys.stdin.read()
+    if not data.strip():
+        die("no input on stdin — pipe `floodgate diff` (optionally through filter-diff)")
+    try:
+        doc = json.loads(data)
+    except json.JSONDecodeError as e:
+        die(f"stdin is not valid JSON: {e}")
+    pairs = collect_units(doc)
+    if not pairs:
+        die("no review_id on stdin — pipe `floodgate diff`, not raw `structured-diff`")
+    apply_marks(review, pairs, args.status)
+    save_review(REVIEW_FILE, review)
+    verb = {"accepted": "accepted", "rejected": "rejected",
+            "skipped": "skipped", "clear": "cleared"}[args.status]
+    print(f"{PROG}: {verb} {len(pairs)} change{'s' if len(pairs) != 1 else ''}.",
+          file=sys.stderr)
+
+
+def cmd_status(args):
+    require("git")
+    review = load_review()
+    if review is None:
+        die(f"no {REVIEW_FILE} here — run `floodgate review <base> <target>` first")
+    base, target = review["base"]["rev"], review["target"]["rev"]
+    mode = review.get("mode", "three-dot")
+    cur_t = rev_parse(target)
+    cur_mb = merge_base(base, target)
+    moved = (review.get("target", {}).get("commit") != cur_t
+             or (mode == "three-dot" and review.get("merge_base") != cur_mb))
+    doc = produce(base, target, mode)
+    annotate(doc, review.get("marks", {}))
+    c = tally([uid for _f, _h, uid in iter_units(doc)], review.get("marks", {}))
+    print(f"review: {base} → {target} ({mode})")
+    print(f"  state file : {REVIEW_FILE}")
+    print(f"  updated    : {review.get('updated', '?')}")
+    print(f"  changes    : {c['total']}")
+    print(f"  accepted   : {c['accepted']}")
+    print(f"  rejected   : {c['rejected']}")
+    print(f"  skipped    : {c['skipped']}")
+    print(f"  unreviewed : {c['unreviewed']}")
+    if moved:
+        print("  WARNING    : branches moved since review start; "
+              "changed hunks show as unreviewed again")
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog=PROG, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd",
+                           metavar="{review,diff,accept,reject,skip,clear,status}")
+
+    pr = sub.add_parser("review", help="start/resume a review and open it in the browser")
+    pr.add_argument("base")
+    pr.add_argument("target")
+    pr.add_argument("-C", "--directory", default=".", help="git repo dir (default: cwd)")
+    pr.add_argument("--two-dot", action="store_true",
+                    help="diff base..target (tips) instead of base...target (merge-base)")
+    pr.add_argument("-p", "--port", type=int, default=8765, help="port (default: 8765)")
+    pr.add_argument("--no-open", action="store_true", help="don't open a browser")
+    pr.set_defaults(func=cmd_review)
+
+    pd = sub.add_parser("diff", help="emit the active review's diff (with ids+status) as JSON")
+    pd.set_defaults(func=cmd_diff)
+
+    for name, status, helptext in [
+            ("accept", "accepted", "mark stdin's changes accepted"),
+            ("reject", "rejected", "mark stdin's changes rejected"),
+            ("skip", "skipped", "mark stdin's changes skipped"),
+            ("clear", "clear", "remove marks for stdin's changes")]:
+        sp = sub.add_parser(name, help=helptext)
+        sp.set_defaults(func=cmd_mark, status=status)
+
+    ps = sub.add_parser("status", help="summarize the active review")
+    ps.set_defaults(func=cmd_status)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        sys.exit(2)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
