@@ -69,12 +69,13 @@ Requirements: `git`, and diffkit's `structured-diff` and `filter-diff` on your
 ### `floodgate review <base> <target>`
 
 ```
-floodgate review [-C DIR] [--only STATUSES | --hide STATUSES]
-                 [--two-dot] [--host HOST] [-p PORT] [--no-open] BASE TARGET
+floodgate review [--continue] [-C DIR] [--only STATUSES | --hide STATUSES]
+                 [--two-dot] [--host HOST] [-p PORT] [--no-open] [BASE TARGET]
 ```
 
 | Option | Meaning |
 | --- | --- |
+| `--continue` | resume the review recorded in `./.review` — no `BASE`/`TARGET` needed |
 | `-C, --directory DIR` | git repo to diff (default: cwd) |
 | `--only STATUSES` | show only entries with these statuses (comma-separated: `accepted,rejected,skipped,unreviewed`) |
 | `--hide STATUSES` | hide entries with these statuses (comma-separated) |
@@ -82,6 +83,11 @@ floodgate review [-C DIR] [--only STATUSES | --hide STATUSES]
 | `--host HOST` | address to bind (default: `127.0.0.1`; use `0.0.0.0` to reach it from outside the container floodgate runs in) |
 | `-p, --port N` | port to serve on (default: 8765; tries the next few if busy) |
 | `--no-open` | don't open a browser automatically |
+
+`BASE` and `TARGET` are required unless you pass `--continue`, which reads them
+(and the diff mode) back from `./.review` so you don't have to retype the
+branches between sessions. `--continue` can't be combined with `BASE`/`TARGET`
+or `--two-dot` (both come from the file).
 
 By default floodgate uses **three-dot** (`base...target`) semantics — the same
 as a GitHub pull request: it shows what `target` introduces relative to the

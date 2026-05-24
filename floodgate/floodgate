@@ -13,6 +13,7 @@ so the hunk correctly resurfaces as unreviewed.
 
 Commands:
     floodgate review <base> <target>   start/resume; serve it in the browser
+    floodgate review --continue         resume ./.review without restating branches
     floodgate diff                      emit the active review's diff as JSON
     floodgate accept                    mark stdin's changes accepted
     floodgate reject                    mark stdin's changes rejected
@@ -651,21 +652,46 @@ def serve(state, host, port, open_browser):
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
+def resolve_pair(args, existing):
+    """Resolve (base, target, mode) for `review`.
+
+    With --continue, take them from an existing .review so the branches needn't
+    be restated; otherwise require BASE and TARGET on the command line. Dies on
+    misuse.
+    """
+    if args.cont:
+        if args.base or args.target:
+            die("--continue takes no BASE/TARGET (they come from .review)")
+        if args.two_dot:
+            die("--continue can't be combined with --two-dot (mode comes from .review)")
+        if existing is None:
+            die(f"no {REVIEW_FILE} here to continue — "
+                "run `floodgate review <base> <target>` first")
+        base = existing.get("base", {}).get("rev")
+        target = existing.get("target", {}).get("rev")
+        if not base or not target:
+            die(f"{REVIEW_FILE} has no branch info to continue from")
+        return base, target, existing.get("mode", "three-dot")
+    if not (args.base and args.target):
+        die("give BASE and TARGET, or --continue to resume the existing review")
+    return args.base, args.target, ("two-dot" if args.two_dot else "three-dot")
+
+
 def cmd_review(args):
     require("git")
     require("structured-diff")
     repo = args.directory
-    base, target = args.base, args.target
-    mode = "two-dot" if args.two_dot else "three-dot"
     visible = resolve_visible(args.only, args.hide)
+    path = Path(REVIEW_FILE)
+    existing = load_review(path)
+
+    base, target, mode = resolve_pair(args, existing)
     base_sha = rev_parse(base, repo)
     target_sha = rev_parse(target, repo)
     mb = merge_base(base, target, repo)
     if mode == "three-dot" and mb is None:
         die(f"{base} and {target} have no common ancestor; use --two-dot")
 
-    path = Path(REVIEW_FILE)
-    existing = load_review(path)
     review, moved = None, False
     if existing:
         same = (existing.get("base", {}).get("rev") == base
@@ -785,8 +811,10 @@ def build_parser():
                            metavar="{review,diff,accept,reject,skip,clear,status}")
 
     pr = sub.add_parser("review", help="start/resume a review and open it in the browser")
-    pr.add_argument("base")
-    pr.add_argument("target")
+    pr.add_argument("base", nargs="?", help="base revision (omit when using --continue)")
+    pr.add_argument("target", nargs="?", help="target revision (omit when using --continue)")
+    pr.add_argument("--continue", dest="cont", action="store_true",
+                    help="resume the review recorded in ./.review (no BASE/TARGET needed)")
     pr.add_argument("-C", "--directory", default=".", help="git repo dir (default: cwd)")
     pr.add_argument("--only", metavar="STATUSES",
                     help="show only these statuses (comma-separated: "

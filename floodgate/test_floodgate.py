@@ -203,6 +203,51 @@ class TestResolveVisible(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# resolve_pair (--continue)
+# --------------------------------------------------------------------------- #
+class _Args:
+    def __init__(self, base=None, target=None, cont=False, two_dot=False):
+        self.base, self.target, self.cont, self.two_dot = base, target, cont, two_dot
+
+
+class TestResolvePair(unittest.TestCase):
+    REVIEW = {"base": {"rev": "main"}, "target": {"rev": "feat"}, "mode": "two-dot"}
+
+    def test_explicit_pair(self):
+        self.assertEqual(fg.resolve_pair(_Args(base="m", target="f"), None),
+                         ("m", "f", "three-dot"))
+        self.assertEqual(fg.resolve_pair(_Args(base="m", target="f", two_dot=True), None),
+                         ("m", "f", "two-dot"))
+
+    def test_missing_pair_errors(self):
+        with silence_stderr():
+            with self.assertRaises(SystemExit):
+                fg.resolve_pair(_Args(), None)
+            with self.assertRaises(SystemExit):
+                fg.resolve_pair(_Args(base="m"), None)        # only one given
+
+    def test_continue_reads_review(self):
+        self.assertEqual(fg.resolve_pair(_Args(cont=True), self.REVIEW),
+                         ("main", "feat", "two-dot"))
+
+    def test_continue_defaults_mode_three_dot(self):
+        self.assertEqual(
+            fg.resolve_pair(_Args(cont=True), {"base": {"rev": "a"}, "target": {"rev": "b"}}),
+            ("a", "b", "three-dot"))
+
+    def test_continue_errors(self):
+        with silence_stderr():
+            with self.assertRaises(SystemExit):                 # no .review
+                fg.resolve_pair(_Args(cont=True), None)
+            with self.assertRaises(SystemExit):                 # branches with --continue
+                fg.resolve_pair(_Args(cont=True, base="m", target="f"), self.REVIEW)
+            with self.assertRaises(SystemExit):                 # --two-dot with --continue
+                fg.resolve_pair(_Args(cont=True, two_dot=True), self.REVIEW)
+            with self.assertRaises(SystemExit):                 # review lacks branch info
+                fg.resolve_pair(_Args(cont=True), {"mode": "three-dot"})
+
+
+# --------------------------------------------------------------------------- #
 # HTML rendering (incl. the view filter)
 # --------------------------------------------------------------------------- #
 class TestRenderPage(unittest.TestCase):
@@ -338,6 +383,12 @@ class TestCli(unittest.TestCase):
         r = self._fg(["review", "master", "feat", "--only", "bogus", "--no-open"], self._repo())
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("unknown status", r.stderr)
+
+    def test_continue_without_review_errors(self):
+        # --continue with no .review dies before serving.
+        r = self._fg(["review", "--continue", "--no-open"], self._repo(with_review=False))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("to continue", r.stderr)
 
 
 if __name__ == "__main__":
