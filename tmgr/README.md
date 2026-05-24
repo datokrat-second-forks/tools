@@ -36,10 +36,11 @@ Requirements:
 | --- | --- |
 | `tmgr new <name> [-m DESC]` | Create a tracked session and attach to it. |
 | `tmgr edit <name>` | Open `<name>.session` in `$EDITOR` (default `vim`). |
-| `tmgr a` | Fuzzy-pick a **running** session and attach/switch to it. |
+| `tmgr a [name]` | Attach to `name` directly, or fuzzy-pick a **running** session if no name is given. |
+| `tmgr rm <name>` | Delete a **non-running** session's tracking files, after a confirmation showing its description. |
 | `tmgr log [text]` | Append `text` to the **current** session's log (must be run inside tmux). |
 | `tmgr logs [name]` | Show a session log: fuzzy-pick one with `fzf`, or pass a name. |
-| `tmgr ls` | List tracked sessions plus their run state. |
+| `tmgr ls [--all]` | List **running** sessions; `--all` also shows remnants (tracked but not running). |
 
 Session names must match `^[A-Za-z0-9][A-Za-z0-9-]*$` (letters, digits and `-`,
 starting alphanumeric — which also keeps tmux happy, since it forbids `.`/`:`).
@@ -61,15 +62,30 @@ starting alphanumeric — which also keeps tmux happy, since it forbids `.`/`:`)
     **you choose** (its created time, description **and `.sessionlog`** are
     preserved/moved with it)
 
-### `tmgr a`
+### `tmgr a [name]`
 
-Lists every running tmux session. Sessions with a `.session` file show their
-description's first line in the list and the full description (plus created time,
-window count and attach state) in the `fzf` preview pane. Sessions started with
-plain `tmux new` appear too, marked *untracked*.
+With a `name`, attaches (or, inside tmux, switches) straight to that session,
+skipping the picker; it errors if no session of that name is running.
+
+With no argument, lists every running tmux session, **most-recently-attached
+first**, so the session you just left sits under the cursor. Each row carries a
+compact age column (`16s`, `2m`, `1h`, `3d`) showing how long ago you were last
+in it. Sessions with a `.session` file show their description's first line in
+the list and the full description (plus created time, window count, attach state
+and last-attached age) in the `fzf` preview pane. Sessions started with plain
+`tmux new` appear too, marked *untracked*.
 
 If you're **inside** tmux, `tmgr a` and `tmgr new` use `switch-client` instead
 of `attach` (you can't nest `tmux attach`).
+
+### `tmgr rm <name>`
+
+Deletes a session's tracking files — its `.session` and, if present, its
+`.sessionlog`. It first prints the files to be removed along with the session's
+created time and description, then asks for a `y/n` confirmation. It refuses if a
+tmux session of that name is currently **running** (kill it first), so it only
+ever clears out remnants. This is the one command that deletes `.session` files;
+nothing else removes them automatically.
 
 ### `tmgr log [text]`
 
@@ -116,4 +132,5 @@ that surviving file is what becomes a "remnant" and drives the `new` menu above.
 
 Alongside it, `tmgr log` may create a plain-text `<name>.sessionlog`. Neither
 file is ever auto-deleted; both are kept for future reference, and the `new`
-menu's rename option `(n)` moves them together.
+menu's rename option `(n)` moves them together. The only command that removes
+them is `tmgr rm`, which deletes both at once after you confirm.

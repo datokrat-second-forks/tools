@@ -7,8 +7,9 @@ creation timestamp and an optional (possibly multi-line) description in TOML.
 Commands:
     tmgr new <name> [-m DESC]   create + attach to a session (tracks it)
     tmgr edit <name>            edit a session's .session file in $EDITOR/vim
-    tmgr a                      fuzzy-pick a running session (fzf) and attach
-    tmgr ls                     list tracked sessions and their run state
+    tmgr a [name]               attach to <name>, or fuzzy-pick one (fzf)
+    tmgr rm <name>              delete a non-running session's tracking files
+    tmgr ls [--all]             list running sessions (--all also shows remnants)
 
 See README.md for details.
 """
@@ -65,6 +66,25 @@ def fmt_dt(value):
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d %H:%M")
     return str(value) if value else "?"
+
+
+def rel_age(epoch):
+    """Compact 'time since' label for a Unix epoch: 5s, 3m, 2h, 4d. '--' if
+    the epoch is missing/zero (e.g. a session that was never attached)."""
+    try:
+        epoch = int(epoch)
+    except (TypeError, ValueError):
+        epoch = 0
+    if not epoch:
+        return "--"
+    secs = max(0, int(datetime.now().timestamp()) - epoch)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
 
 
 def first_line(text):
@@ -160,6 +180,33 @@ def running_sessions():
     return [ln for ln in res.stdout.splitlines() if ln]
 
 
+def running_sessions_recent():
+    """Running sessions as (name, last_attached_epoch) pairs, most-recently
+    attached first. last_attached is 0 for a session that was never attached,
+    which sorts it to the bottom. Name (last field) may contain spaces."""
+    res = tmux(
+        "list-sessions",
+        "-F", "#{session_last_attached}\t#{session_name}",
+        capture=True,
+    )
+    if res.returncode != 0:
+        return []
+    out = []
+    for ln in res.stdout.splitlines():
+        if not ln:
+            continue
+        la, _, name = ln.partition("\t")
+        if not name:
+            continue
+        try:
+            epoch = int(la)
+        except ValueError:
+            epoch = 0
+        out.append((name, epoch))
+    out.sort(key=lambda t: (-t[1], t[0]))  # newest first, then name for stability
+    return out
+
+
 def current_session():
     """Name of the tmux session containing the current pane, or None."""
     if not in_tmux():
@@ -181,15 +228,16 @@ def session_info(name):
     # so sessions whose names contain spaces still parse with maxsplit.
     res = tmux(
         "list-sessions",
-        "-F", "#{session_windows} #{session_attached} #{session_name}",
+        "-F", "#{session_windows} #{session_attached} #{session_last_attached} #{session_name}",
         capture=True,
     )
     if res.returncode != 0:
         return None
     for line in res.stdout.splitlines():
-        parts = line.split(" ", 2)
-        if len(parts) == 3 and parts[2] == name:
-            return {"windows": parts[0], "attached": parts[1]}
+        parts = line.split(" ", 3)
+        if len(parts) == 4 and parts[3] == name:
+            return {"windows": parts[0], "attached": parts[1],
+                    "last_attached": parts[2]}
     return None
 
 
@@ -371,27 +419,90 @@ def cmd_log(args):
 
 def cmd_a(args):
     require("tmux")
-    sessions = running_sessions()
+
+    # A name was given: attach straight to it, skipping the fzf picker.
+    if args.name:
+        name = args.name
+        if not valid_name(name):
+            die(f"invalid session name '{name}'")
+        if not session_running(name):
+            die(f"no running session '{name}' "
+                f"(see `tmgr ls`; start one with `tmgr new {name}`)")
+        attach(name)
+        return
+
+    sessions = running_sessions_recent()
     if not sessions:
         print("No running tmux sessions. Start one with: tmgr new <name>")
         return
 
+    # Most-recently-attached first, with a compact age column so the session you
+    # just left sits under the cursor instead of needing a visual scan. The bare
+    # name is kept as a hidden first field for the preview and for parsing; the
+    # pre-formatted, aligned display goes in field 2.
+    width = max(len(name) for name, _ in sessions)
     lines = []
-    for s in sessions:
-        desc = ""
-        p = session_path(s)
+    for name, last_attached in sessions:
+        p = session_path(name)
         if p.exists():
             try:
                 desc = first_line(load_session(p).get("description", ""))
             except Exception:
                 desc = "(unreadable .session)"
-        lines.append(f"{s}\t{desc}")
+        else:
+            desc = "(untracked)"
+        display = f"{rel_age(last_attached):<4} {name:<{width}}  {desc}".rstrip()
+        lines.append(f"{name}\t{display}")
 
-    choice = pick(lines)
+    choice = pick(lines, with_nth="2")
     if not choice:
         return
     name = choice.split("\t", 1)[0]
     attach(name)
+
+
+def cmd_rm(args):
+    require("tmux")
+    name = args.name
+    if not valid_name(name):
+        die(f"invalid session name '{name}'")
+
+    # Refuse to remove tracking for a live session; kill it first.
+    if session_running(name):
+        die(f"session '{name}' is running; detach and kill it first "
+            f"(e.g. `tmux kill-session -t {name}`)")
+
+    spath = session_path(name)
+    lpath = sessionlog_path(name)
+    targets = [p for p in (spath, lpath) if p.exists()]
+    if not targets:
+        die(f"nothing to remove for '{name}' (no .session or .sessionlog file)")
+
+    # Surface the description (and created time) so a confirmed delete is informed.
+    print(f"About to remove tracking files for '{name}':")
+    for p in targets:
+        print(f"  - {p}")
+    if spath.exists():
+        try:
+            data = load_session(spath)
+        except Exception as e:
+            print(f"  (warning: {spath} is not valid TOML: {e})")
+        else:
+            print(f"  created: {fmt_dt(data.get('created'))}")
+            desc = (data.get("description") or "").strip()
+            if desc:
+                print("  description:")
+                for line in desc.splitlines():
+                    print(f"    {line}")
+            else:
+                print("  description: (none)")
+
+    if choose("delete these files? [y/n]: ", "yn") != "y":
+        print("  aborted; nothing removed")
+        return
+    for p in targets:
+        p.unlink()
+        print(f"  removed {p}")
 
 
 def cmd_logs(args):
@@ -423,20 +534,26 @@ def cmd_logs(args):
         sys.stdout.write(path.read_text())
 
 
-def pick(lines, preview="_preview", prompt="session> "):
-    """Pick one of `lines` (tab-separated name<TAB>extra). `preview` names the
-    hidden subcommand that renders the fzf preview for field 1. Returns the line."""
+def pick(lines, preview="_preview", prompt="session> ", with_nth="1,2", key="1"):
+    """Pick one of `lines` (tab-separated fields). `with_nth` selects which
+    fields fzf shows; `key` is the field index handed to the `preview`
+    subcommand. Returns the full chosen line — callers parse out the field they
+    need (the key field is always field 1 in our callers)."""
     if shutil.which("fzf"):
         self_path = os.path.realpath(sys.argv[0])
         preview_cmd = (
-            f"{shlex.quote(sys.executable)} {shlex.quote(self_path)} {preview} {{1}}"
+            f"{shlex.quote(sys.executable)} {shlex.quote(self_path)} {preview} {{{key}}}"
         )
         res = subprocess.run(
             [
                 "fzf",
                 "--delimiter", "\t",
-                "--with-nth", "1,2",
+                "--with-nth", with_nth,
                 "--prompt", prompt,
+                # fzf's default scheme assumes a dark terminal and tints the
+                # gutter (bg+), which shows as a black strip on a light one.
+                # -1 = terminal default, so it blends in either way.
+                "--color", "gutter:-1",
                 "--preview", preview_cmd,
                 "--preview-window", "right,55%,wrap",
             ],
@@ -448,11 +565,13 @@ def pick(lines, preview="_preview", prompt="session> "):
             return None
         return res.stdout.strip() or None
 
-    # Fallback when fzf is unavailable.
+    # Fallback when fzf is unavailable: render the same fields `with_nth` shows.
     print("(fzf not found - falling back to a numbered list)\n")
+    shown = [int(x) for x in with_nth.split(",")]
     for i, ln in enumerate(lines, 1):
-        name, _, desc = ln.partition("\t")
-        print(f"  {i:2}. {name}" + (f"  -  {desc}" if desc else ""))
+        cols = ln.split("\t")
+        text = "  ".join(cols[f - 1] for f in shown if 0 < f <= len(cols))
+        print(f"  {i:2}. {text}")
     try:
         raw = input("\nselect number (blank to cancel): ").strip()
     except EOFError:
@@ -472,6 +591,8 @@ def cmd_preview(args):
         state = "attached" if info["attached"] not in ("0", "") else "detached"
         print(f"  status   : running, {state}")
         print(f"  windows  : {info['windows']}")
+        if info.get("last_attached") not in (None, "", "0"):
+            print(f"  attached : last {rel_age(info['last_attached'])} ago")
     p = session_path(name)
     if not p.exists():
         print("  tracking : untracked (no .session file)")
@@ -503,26 +624,38 @@ def cmd_logpreview(args):
 
 def cmd_ls(args):
     files = sorted(TMGR_DIR.glob("*.session")) if TMGR_DIR.exists() else []
-    live = set(running_sessions()) if shutil.which("tmux") else set()
+    have_tmux = bool(shutil.which("tmux"))
+    live = set(running_sessions()) if have_tmux else set()
+    # Default to running-only; --all also lists remnants. Without tmux we can't
+    # tell what's running, so fall back to showing everything.
+    show_all = args.all or not have_tmux
     tracked = set()
 
-    if not files and not live:
-        print("No tracked sessions and no running tmux sessions.")
-        return
-
-    print(f"{'STATE':9} {'NAME':20} DESCRIPTION")
+    rows = []
     for f in files:
         name = f.name[: -len(".session")]
         tracked.add(name)
-        state = "running" if name in live else "remnant"
-        desc = ""
+        running = name in live
+        if not running and not show_all:
+            continue
         try:
             desc = first_line(load_session(f).get("description", ""))
         except Exception:
             desc = "(unreadable)"
-        print(f"{state:9} {name:20} {desc}")
+        rows.append(("running" if running else "remnant", name, desc))
     for name in sorted(live - tracked):
-        print(f"{'running':9} {name:20} (untracked)")
+        rows.append(("running", name, "(untracked)"))
+
+    if not rows:
+        if not show_all and tracked:
+            print("No running sessions. Use `tmgr ls --all` to include remnants.")
+        else:
+            print("No tracked sessions and no running tmux sessions.")
+        return
+
+    print(f"{'STATE':9} {'NAME':20} DESCRIPTION")
+    for state, name, desc in rows:
+        print(f"{state:9} {name:20} {desc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -530,7 +663,7 @@ def cmd_ls(args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(prog="tmgr", description="A small tmux session manager.")
-    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,log,logs,ls}")
+    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,rm,log,logs,ls}")
 
     pn = sub.add_parser("new", help="create + attach to a tracked session")
     pn.add_argument("name")
@@ -541,8 +674,13 @@ def build_parser():
     pe.add_argument("name")
     pe.set_defaults(func=cmd_edit)
 
-    pa = sub.add_parser("a", help="fuzzy-pick a running session and attach")
+    pa = sub.add_parser("a", help="attach to a session (fuzzy-pick if no name given)")
+    pa.add_argument("name", nargs="?", help="session to attach to (default: pick with fzf)")
     pa.set_defaults(func=cmd_a)
+
+    pr = sub.add_parser("rm", help="delete a non-running session's tracking files")
+    pr.add_argument("name")
+    pr.set_defaults(func=cmd_rm)
 
     pg = sub.add_parser("log", help="append text to the current session's log (inside tmux)")
     pg.add_argument("text", nargs="*", help="text to append (or pipe via stdin)")
@@ -552,7 +690,9 @@ def build_parser():
     pgs.add_argument("name", nargs="?", help="session whose log to show (default: pick with fzf)")
     pgs.set_defaults(func=cmd_logs)
 
-    pl = sub.add_parser("ls", help="list tracked sessions and run state")
+    pl = sub.add_parser("ls", help="list running sessions (use --all for remnants too)")
+    pl.add_argument("-a", "--all", action="store_true",
+                    help="also list tracked sessions that aren't running (remnants)")
     pl.set_defaults(func=cmd_ls)
 
     pp = sub.add_parser("_preview")  # hidden helper for fzf
