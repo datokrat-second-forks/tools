@@ -163,3 +163,17 @@ what's left.
 
 Each mark stores the path and timestamp alongside the status, so the file stays
 readable and `floodgate status` can summarize without re-running git.
+
+## Tests
+
+A stdlib `unittest` suite (no third-party packages) covers review-id derivation,
+annotation/roll-up, marks, the `--only`/`--hide` resolver, and HTML rendering
+(including the view filter), plus a few CLI integration tests through a real git
+repo + diffkit:
+
+```sh
+python3 test_floodgate.py        # or: python3 -m unittest -v
+```
+
+The integration tests are skipped if `git` or diffkit's `structured-diff` isn't
+available.

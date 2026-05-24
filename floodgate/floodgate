@@ -75,7 +75,7 @@ def esc(s):
 
 def resolve_visible(only, hide):
     """Resolve --only / --hide into the set of statuses to show (None = all)."""
-    if only and hide:
+    if only is not None and hide is not None:
         die("use only one of --only / --hide")
 
     def parse(spec, flag):
@@ -88,9 +88,9 @@ def resolve_visible(only, hide):
                 f"(choose from {', '.join(ALL_VIEW_STATUSES)})")
         return names
 
-    if only:
+    if only is not None:
         return parse(only, "--only")
-    if hide:
+    if hide is not None:
         return set(ALL_VIEW_STATUSES) - parse(hide, "--hide")
     return None
 
@@ -197,9 +197,9 @@ def iter_units(doc):
     for f in doc.get("files", []):
         if f.get("hunks"):
             for h in f["hunks"]:
-                yield f, h, h["review_id"]
+                yield f, h, h.get("review_id")
         else:
-            yield f, None, f["review_id"]
+            yield f, None, f.get("review_id")
 
 
 def collect_units(doc):
