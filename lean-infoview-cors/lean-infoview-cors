@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""lean-infoview-cors - add crossorigin="anonymous" to the Lean InfoView stylesheet link.
+
+The Lean 4 VS Code extension embeds the InfoView in an iframe and loads its
+stylesheet from a vscode-cdn URL derived from the host that serves VS Code.
+When VS Code is reached over the network (typically via code-server on a
+remote machine), modern browsers refuse to apply that stylesheet unless the
+<link> tag carries an explicit `crossorigin` attribute. The visible symptom
+is an InfoView with no styling.
+
+This tool patches the extension's bundled extension.js so the generated link
+includes `crossorigin="anonymous"`. The change persists across browser
+sessions but must be reapplied after each extension upgrade -- just run the
+tool again, it's idempotent.
+
+Usage:
+    lean-infoview-cors            # patch the newest installed version
+    lean-infoview-cors --status   # list installed versions and patch state
+    lean-infoview-cors --dir DIR  # override the extensions directory
+
+Defaults to ~/.local/share/code-server/extensions (the code-server location
+on Linux). For desktop VS Code pass --dir ~/.vscode/extensions.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+PROG = "lean-infoview-cors"
+DEFAULT_DIR = Path.home() / ".local/share/code-server/extensions"
+EXT_GLOB = "leanprover.lean4-*"
+REL_TARGET = "dist/extension.js"
+
+# The exact bytes the bundled extension.js emits for the InfoView stylesheet
+# link, and what we want it to look like after patching. The two strings
+# differ only in the inserted `crossorigin="anonymous" ` -- NEEDLE is not a
+# substring of PATCHED, so we can tell the two states apart unambiguously.
+NEEDLE = '<link rel="stylesheet" href="${this.getLocalPath("dist/lean4-infoview/index.css")}">'
+PATCHED = '<link rel="stylesheet" crossorigin="anonymous" href="${this.getLocalPath("dist/lean4-infoview/index.css")}">'
+
+VERSION_RE = re.compile(r"^leanprover\.lean4-(\d+(?:\.\d+)+)(?:-.*)?$")
+
+
+def die(msg, code=1):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_installs(ext_dir):
+    """Return [(version_tuple, path), ...] sorted oldest -> newest."""
+    if not ext_dir.is_dir():
+        die(f"extensions directory not found: {ext_dir}")
+    found = []
+    for p in ext_dir.glob(EXT_GLOB):
+        if not p.is_dir():
+            continue
+        m = VERSION_RE.match(p.name)
+        if not m:
+            continue
+        ver = tuple(int(x) for x in m.group(1).split("."))
+        found.append((ver, p))
+    found.sort()
+    return found
+
+
+def patch_state(extension_js):
+    """One of: 'patched', 'unpatched', 'missing', 'unknown'."""
+    if not extension_js.is_file():
+        return "missing"
+    text = extension_js.read_text(encoding="utf-8", errors="surrogateescape")
+    if PATCHED in text:
+        return "patched"
+    if NEEDLE in text:
+        return "unpatched"
+    return "unknown"
+
+
+def apply_patch(extension_js):
+    text = extension_js.read_text(encoding="utf-8", errors="surrogateescape")
+    n = text.count(NEEDLE)
+    if n:
+        extension_js.write_text(
+            text.replace(NEEDLE, PATCHED),
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    return n
+
+
+def cmd_status(installs):
+    if not installs:
+        print("no leanprover.lean4 extension installed")
+        return
+    width = max(len(p.name) for _, p in installs)
+    for i, (_, path) in enumerate(installs):
+        tag = " (latest)" if i == len(installs) - 1 else ""
+        state = patch_state(path / REL_TARGET)
+        print(f"{path.name:<{width}}  {state}{tag}")
+
+
+def cmd_patch(installs):
+    if not installs:
+        die("no leanprover.lean4 extension installed")
+    _, target = installs[-1]
+    js = target / REL_TARGET
+    state = patch_state(js)
+    if state == "missing":
+        die(f"{js} does not exist")
+    if state == "patched":
+        print(f"{target.name}: already patched")
+        return
+    if state == "unknown":
+        die(
+            f"{target.name}: stylesheet link not found in extension.js -- "
+            "the extension may have changed format. Looked for:\n  " + NEEDLE
+        )
+    n = apply_patch(js)
+    print(f"{target.name}: patched ({n} replacement{'s' if n != 1 else ''})")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog=PROG,
+        description='Add crossorigin="anonymous" to the Lean InfoView stylesheet link.',
+    )
+    ap.add_argument(
+        "--dir",
+        type=Path,
+        default=DEFAULT_DIR,
+        help=f"extensions directory (default: {DEFAULT_DIR})",
+    )
+    ap.add_argument(
+        "--status",
+        action="store_true",
+        help="list installed Lean extension versions and their patch state",
+    )
+    args = ap.parse_args(argv)
+
+    installs = find_installs(args.dir)
+    if args.status:
+        cmd_status(installs)
+    else:
+        cmd_patch(installs)
+
+
+if __name__ == "__main__":
+    main()
