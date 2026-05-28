@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""leansnip - manage VSCode snippets for Lean 4 from a single git repo.
+
+The snippets live in one file, ``lean4.json``, inside a git repo you own (the
+"snippets repo"). Because the file is named ``lean4.json`` it is picked up by
+VSCode as a *language-scoped* user snippet for the Lean 4 extension's ``lean4``
+language id -- it applies to every ``.lean`` file in every workspace, with no
+per-snippet ``scope`` needed.
+
+leansnip wires that repo into VSCode by *symlinking* it into each installed
+editor's user-snippets directory:
+
+    <editor>/User/snippets/lean4.json  ->  <repo>/lean4.json
+
+Known editors are auto-detected, including code-server (whose user-data dir
+lives under ~/.local/share, not ~/.config). For non-standard locations -- a
+custom --user-data-dir, a Flatpak install, a remote mount -- register the
+snippets dir once with `leansnip target add <dir>`; link/status/unlink then act
+on the auto-detected editors and your registered targets together.
+
+Because it is a symlink, editing snippets through VSCode's built-in "Configure
+Snippets" editor writes straight back into the git-tracked file -- the repo
+stays the single source of truth, whichever way you edit. ``add`` and ``rm``
+parse and rewrite ``lean4.json`` as strict JSON.
+
+The repo path is remembered in ~/.tools/leansnip/config, so leansnip can be
+run from anywhere.
+
+Commands:
+    leansnip repo [PATH]      show, or set, the snippets repo path
+    leansnip link             symlink lean4.json into detected + registered dirs
+    leansnip unlink           remove leansnip's symlinks
+    leansnip target [a] [DIR]  list/add/remove custom snippet dirs to link into
+    leansnip status           repo + git + per-editor link state
+    leansnip ls               list snippets (name, prefix, description)
+    leansnip add [NAME] ...    add a snippet; prompts for anything not passed
+    leansnip rm NAME          remove a snippet by name
+    leansnip edit             open lean4.json in $EDITOR
+    leansnip sync             git pull --rebase --autostash && git push
+
+See README.md for details.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+PROG = "leansnip"
+SNIPPET_FILE = "lean4.json"   # filename == VSCode language id "lean4"
+LANG = "lean4"
+PIPE = subprocess.PIPE
+
+# Desktop (Electron) editors keep their User dir under the platform *config*
+# root; each maps a directory name to a human label. code-server is handled
+# separately: it keeps its user-data dir under the XDG *data* root instead.
+DESKTOP_EDITORS = {
+    "Code": "VS Code",
+    "Code - Insiders": "VS Code Insiders",
+    "Code - OSS": "Code - OSS",
+    "VSCodium": "VSCodium",
+    "Cursor": "Cursor",
+    "Windsurf": "Windsurf",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def die(msg, code=1):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now_stamp():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+# --------------------------------------------------------------------------- #
+# Config: the remembered snippets-repo path
+# --------------------------------------------------------------------------- #
+def tool_config_dir():
+    """Where leansnip keeps its own state -- matches tmgr's ~/.tools/<tool>/."""
+    return Path.home() / ".tools" / PROG
+
+
+def config_file():
+    return tool_config_dir() / "config"
+
+
+def load_config():
+    p = config_file()
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"cannot read config {p}: {e}")
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(cfg):
+    p = config_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def resolve_repo(args):
+    """Repo path from --repo, then $LEANSNIP_REPO, then the saved config."""
+    raw = getattr(args, "repo", None) or os.environ.get("LEANSNIP_REPO") \
+        or load_config().get("repo")
+    if not raw:
+        die("no snippets repo set -- run "
+            f"`{PROG} repo /path/to/repo` first (it must be an existing dir)")
+    repo = Path(raw).expanduser()
+    if not repo.is_dir():
+        die(f"snippets repo {repo} is not a directory")
+    return repo
+
+
+# --------------------------------------------------------------------------- #
+# The snippet file (strict JSON)
+# --------------------------------------------------------------------------- #
+def snippet_path(repo):
+    return repo / SNIPPET_FILE
+
+
+class SnippetFileError(Exception):
+    """lean4.json exists but can't be read as a snippet object."""
+
+
+def read_snippets(repo):
+    """Parse <repo>/lean4.json. Missing file -> {}. Invalid -> SnippetFileError
+    (so callers can choose to abort or just report it)."""
+    p = snippet_path(repo)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise SnippetFileError(f"{p} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        raise SnippetFileError(
+            f"{p}: top level must be a JSON object, got {type(data).__name__}")
+    return data
+
+
+def read_snippets_or_die(repo):
+    """read_snippets, but turn a bad file into a clean exit -- for commands
+    (ls, add, rm) that can't sensibly proceed without parsing the file."""
+    try:
+        return read_snippets(repo)
+    except SnippetFileError as e:
+        die(str(e))
+
+
+def write_snippets(repo, data):
+    p = snippet_path(repo)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                 encoding="utf-8")
+
+
+def normalize_body(lines):
+    """VSCode accepts a string or a list of strings; store one line as a
+    string and several as a list, for clean diffs either way."""
+    lines = list(lines)
+    if not lines:
+        raise ValueError("snippet body is empty")
+    return lines[0] if len(lines) == 1 else lines
+
+
+def body_lines(body):
+    """Inverse view of a stored body: always a list of display lines."""
+    if isinstance(body, str):
+        return body.split("\n")
+    return [str(x) for x in body]
+
+
+def add_snippet(data, name, prefix, body, description=None):
+    """Return a new dict with NAME added. Raises ValueError if NAME exists."""
+    if name in data:
+        raise ValueError(f"a snippet named {name!r} already exists "
+                         f"(use `{PROG} rm {name!r}` first, or pick another name)")
+    entry = {"prefix": prefix, "body": normalize_body(body)}
+    if description:
+        entry["description"] = description
+    out = dict(data)
+    out[name] = entry
+    return out
+
+
+def remove_snippet(data, name):
+    """Return a new dict with NAME removed. Raises KeyError if absent."""
+    if name not in data:
+        raise KeyError(name)
+    out = dict(data)
+    del out[name]
+    return out
+
+
+def describe_snippet(name, entry):
+    """(name, prefix, description) for listing; tolerant of odd shapes."""
+    if not isinstance(entry, dict):
+        return (name, "?", "(malformed entry)")
+    prefix = entry.get("prefix", "")
+    if isinstance(prefix, list):
+        prefix = ", ".join(str(p) for p in prefix)
+    return (name, str(prefix), entry.get("description", ""))
+
+
+# --------------------------------------------------------------------------- #
+# Editor discovery + symlinking
+# --------------------------------------------------------------------------- #
+def config_data_roots():
+    """(config_root, data_root) for this platform.
+
+    Electron editors keep their User dir under the config root; code-server
+    keeps its user-data dir under the XDG *data* root (~/.local/share)."""
+    if sys.platform == "darwin":
+        appsup = Path.home() / "Library" / "Application Support"
+        return appsup, appsup
+    if sys.platform.startswith("win"):
+        appdata = Path(os.environ.get("APPDATA")
+                       or (Path.home() / "AppData" / "Roaming"))
+        return appdata, appdata
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    data = Path(os.environ.get("XDG_DATA_HOME")
+                or (Path.home() / ".local" / "share"))
+    return cfg, data
+
+
+def known_editor_user_dirs():
+    """[(label, user_dir)] for every editor we know how to find on this box."""
+    cfg, data = config_data_roots()
+    dirs = [(label, cfg / dirname / "User")
+            for dirname, label in DESKTOP_EDITORS.items()]
+    dirs.append(("code-server", data / "code-server" / "User"))
+    return dirs
+
+
+def detected_snippet_dirs():
+    """[(label, snippets_dir)] for editors whose User dir exists on this box.
+
+    The snippets dir is ``User/snippets`` (created lazily when we link)."""
+    return [(label, user / "snippets")
+            for label, user in known_editor_user_dirs() if user.is_dir()]
+
+
+def resolve_key(p):
+    """Normalized identity for a path, for deduping; need not exist."""
+    return os.path.normcase(os.path.realpath(str(Path(p).expanduser())))
+
+
+def effective_targets(args):
+    """[(label, snippets_dir)] to act on. ``--dir`` overrides everything;
+    otherwise auto-detected editors plus registered custom targets, deduped."""
+    if getattr(args, "dir", None):
+        return [("(--dir)", Path(args.dir).expanduser())]
+    out, seen = [], set()
+    for label, sdir in detected_snippet_dirs():
+        k = resolve_key(sdir)
+        if k not in seen:
+            seen.add(k)
+            out.append((label, sdir))
+    for raw in load_config().get("targets", []):
+        sdir = Path(raw).expanduser()
+        k = resolve_key(sdir)
+        if k not in seen:
+            seen.add(k)
+            out.append(("(custom)", sdir))
+    return out
+
+
+def link_one(repo, snippets_dir):
+    """Point <snippets_dir>/lean4.json at <repo>/lean4.json. Returns a status
+    string describing what happened."""
+    src = snippet_path(repo).resolve()
+    snippets_dir.mkdir(parents=True, exist_ok=True)
+    target = snippets_dir / SNIPPET_FILE
+
+    if target.is_symlink():
+        try:
+            already = target.resolve() == src
+        except OSError:
+            already = False
+        if already:
+            return "already linked"
+        old = os.readlink(target)
+        target.unlink()
+        os.symlink(src, target)
+        return f"relinked (was -> {old})"
+
+    if target.exists():
+        bak = snippets_dir / f"{SNIPPET_FILE}.bak.{now_stamp()}"
+        target.rename(bak)
+        os.symlink(src, target)
+        return f"linked (backed up existing file to {bak.name})"
+
+    os.symlink(src, target)
+    return "linked"
+
+
+def unlink_one(snippets_dir):
+    target = snippets_dir / SNIPPET_FILE
+    if target.is_symlink():
+        target.unlink()
+        return "unlinked"
+    if target.exists():
+        return "left in place (a real file, not a leansnip symlink)"
+    return "nothing to unlink"
+
+
+def link_state(repo, snippets_dir):
+    """Describe how <snippets_dir>/lean4.json relates to our repo file."""
+    target = snippets_dir / SNIPPET_FILE
+    if target.is_symlink():
+        try:
+            dest = target.resolve()
+        except OSError:
+            return f"dangling symlink -> {os.readlink(target)}"
+        if dest == snippet_path(repo).resolve():
+            return "linked"
+        return f"symlink -> {dest} (not this repo)"
+    if target.exists():
+        return "a real file (not linked)"
+    return "not linked"
+
+
+# --------------------------------------------------------------------------- #
+# git
+# --------------------------------------------------------------------------- #
+def git(repo, *args, check=False):
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          text=True, stdout=PIPE, stderr=PIPE, check=check)
+
+
+def is_git_repo(repo):
+    return git(repo, "rev-parse", "--git-dir").returncode == 0
+
+
+def git_summary(repo):
+    """One-line working-tree summary, or None if not a git repo."""
+    if not is_git_repo(repo):
+        return None
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "(detached)"
+    dirty = bool(git(repo, "status", "--porcelain").stdout.strip())
+    parts = [f"branch {branch}", "dirty" if dirty else "clean"]
+    counts = git(repo, "rev-list", "--left-right", "--count", "@{u}...HEAD")
+    if counts.returncode == 0:
+        behind, ahead = (counts.stdout.split() + ["0", "0"])[:2]
+        if ahead != "0" or behind != "0":
+            parts.append(f"ahead {ahead}, behind {behind}")
+    else:
+        parts.append("no upstream")
+    return ", ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+def cmd_repo(args):
+    if args.path is None:
+        cfg = load_config()
+        print(cfg.get("repo") or "(no snippets repo set)")
+        return
+    repo = Path(args.path).expanduser()
+    if not repo.is_dir():
+        die(f"{repo} is not an existing directory "
+            "(create the repo yourself first; leansnip only points at it)")
+    cfg = load_config()
+    cfg["repo"] = str(repo.resolve())
+    save_config(cfg)
+    print(f"snippets repo set to {cfg['repo']}")
+    if not is_git_repo(repo):
+        print(f"note: {repo} is not a git repo yet -- "
+              "`git init` it so you can version and sync your snippets.")
+
+
+def cmd_link(args):
+    repo = resolve_repo(args)
+    # Make sure there is a file to link to, even before any snippets exist.
+    if not snippet_path(repo).exists():
+        write_snippets(repo, {})
+        print(f"created {snippet_path(repo)} (empty)")
+    targets = effective_targets(args)
+    if not targets:
+        die("no editor auto-detected and no custom targets registered -- add "
+            f"one with `{PROG} target add <snippets-dir>` or pass --dir")
+    for label, sdir in targets:
+        print(f"{label}: {link_one(repo, sdir)}  [{sdir / SNIPPET_FILE}]")
+
+
+def cmd_unlink(args):
+    targets = effective_targets(args)
+    if not targets:
+        die("nothing to unlink -- no editor detected and no custom targets "
+            "registered")
+    for label, sdir in targets:
+        print(f"{label}: {unlink_one(sdir)}")
+
+
+def cmd_status(args):
+    repo = resolve_repo(args)
+    print(f"repo:    {repo}")
+    # Don't abort on a broken file -- status is the command you run to find out.
+    try:
+        n = len(read_snippets(repo))
+        print(f"file:    {snippet_path(repo)} ({n} snippet{'' if n == 1 else 's'})")
+    except SnippetFileError as e:
+        print(f"file:    {snippet_path(repo)}  ** INVALID **")
+        print(f"         {e}")
+    summary = git_summary(repo)
+    print(f"git:     {summary if summary else '(not a git repo)'}")
+    targets = effective_targets(args)
+    if not targets:
+        print("editors: none detected and no custom targets registered")
+    else:
+        print("editors:")
+        for label, sdir in targets:
+            state = link_state(repo, sdir)
+            # Custom targets have a generic label, so show their path inline.
+            if label == "(custom)":
+                print(f"  (custom) {sdir}: {state}")
+            else:
+                print(f"  {label}: {state}")
+
+
+def cmd_target(args):
+    cfg = load_config()
+    targets = list(cfg.get("targets", []))
+    if args.action == "ls":
+        if not targets:
+            print("(no custom targets registered; known editors are "
+                  "auto-detected)")
+        for t in targets:
+            print(t)
+        return
+    if not args.path:
+        die(f"`{PROG} target {args.action}` needs a PATH")
+    path = Path(args.path).expanduser()
+    if args.action == "add":
+        if any(resolve_key(t) == resolve_key(path) for t in targets):
+            print(f"already registered: {path}")
+            return
+        targets.append(str(path))
+        cfg["targets"] = targets
+        save_config(cfg)
+        print(f"registered target: {path}")
+        if not path.exists() and not path.parent.exists():
+            print(f"note: {path} doesn't exist yet -- `{PROG} link` will create "
+                  "it; double-check the path if that's unexpected.")
+    else:  # rm
+        kept = [t for t in targets if resolve_key(t) != resolve_key(path)]
+        if len(kept) == len(targets):
+            die(f"not a registered target: {path} (see `{PROG} target ls`)")
+        cfg["targets"] = kept
+        save_config(cfg)
+        print(f"removed target: {path}")
+
+
+def cmd_ls(args):
+    repo = resolve_repo(args)
+    data = read_snippets_or_die(repo)
+    if not data:
+        print("(no snippets yet)")
+        return
+    rows = [describe_snippet(n, e) for n, e in data.items()]
+    wname = max(len(r[0]) for r in rows)
+    wpref = max(len(r[1]) for r in rows)
+    for name, prefix, desc in rows:
+        line = f"{name:<{wname}}  {prefix:<{wpref}}"
+        if desc:
+            line += f"  {desc}"
+        print(line)
+
+
+def prompt_optional(prompt, default=""):
+    """Read one line; empty input (or Ctrl-D) yields the default."""
+    try:
+        ans = input(prompt).strip()
+    except EOFError:
+        print()
+        return default
+    return ans or default
+
+
+def prompt_name(data):
+    """Prompt for a non-empty, not-yet-used snippet name."""
+    while True:
+        try:
+            name = input("Name: ").strip()
+        except EOFError:
+            die("aborted (no name given)")
+        if not name:
+            print("  name can't be empty")
+        elif name in data:
+            print(f"  {name!r} already exists -- choose another")
+        else:
+            return name
+
+
+def prompt_body():
+    """Read body lines interactively until Ctrl-D."""
+    print("Body -- type the snippet lines, then Ctrl-D on a blank line.")
+    print("  ($1/$2 tab stops, $0 final stop, ${1:foo} placeholders all work)")
+    lines = []
+    while True:
+        try:
+            lines.append(input())
+        except EOFError:
+            print()
+            return lines
+
+
+def collect_body(args):
+    """Body lines from repeated --body (each split on newlines); else piped
+    stdin; else, at an interactive terminal, prompt for them."""
+    if args.body:
+        lines = []
+        for chunk in args.body:
+            lines.extend(chunk.split("\n"))
+        return lines
+    if not sys.stdin.isatty():
+        text = sys.stdin.read()
+        if text.endswith("\n"):
+            text = text[:-1]
+        return text.split("\n") if text else []
+    return prompt_body()
+
+
+def cmd_add(args):
+    repo = resolve_repo(args)
+    data = read_snippets_or_die(repo)
+    interactive = sys.stdin.isatty()
+
+    # Each field: use the flag if given, otherwise prompt (interactive only).
+    name = args.name
+    if name is None:
+        if not interactive:
+            die("a snippet name is required (pass it as an argument)")
+        name = prompt_name(data)
+    elif name in data:
+        die(f"a snippet named {name!r} already exists "
+            f"(use `{PROG} rm {name!r}` first, or pick another name)")
+
+    if args.prefix is not None:
+        prefix = args.prefix
+    elif interactive:
+        prefix = prompt_optional(f"Prefix [{name}]: ", default=name)
+    else:
+        prefix = name
+
+    if args.desc is not None:
+        desc = args.desc
+    elif interactive:
+        desc = prompt_optional("Description (optional): ") or None
+    else:
+        desc = None
+
+    body = collect_body(args)
+    if not body or body == [""]:
+        die("snippet body is empty")
+
+    try:
+        data = add_snippet(data, name, prefix, body, desc)
+    except ValueError as e:
+        die(str(e))
+    write_snippets(repo, data)
+    print(f"added {name!r} (prefix {prefix!r}); {len(data)} snippets total")
+
+
+def cmd_rm(args):
+    repo = resolve_repo(args)
+    data = read_snippets_or_die(repo)
+    try:
+        data = remove_snippet(data, args.name)
+    except KeyError:
+        die(f"no snippet named {args.name!r} (see `{PROG} ls`)")
+    write_snippets(repo, data)
+    print(f"removed {args.name!r}; {len(data)} snippets left")
+
+
+def cmd_edit(args):
+    repo = resolve_repo(args)
+    if not snippet_path(repo).exists():
+        write_snippets(repo, {})
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        die("no $EDITOR or $VISUAL set")
+    rc = subprocess.run(f"{editor} {json.dumps(str(snippet_path(repo)))}",
+                        shell=True).returncode
+    if rc != 0:
+        die(f"editor exited with status {rc}", rc)
+    # Validate after editing so a stray comma is caught now, not by VSCode.
+    try:
+        json.loads(snippet_path(repo).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"warning: {snippet_path(repo)} is no longer valid JSON: {e}")
+
+
+def cmd_sync(args):
+    repo = resolve_repo(args)
+    if not is_git_repo(repo):
+        die(f"{repo} is not a git repo")
+    for step in (["pull", "--rebase", "--autostash"], ["push"]):
+        res = git(repo, *step)
+        sys.stdout.write(res.stdout)
+        sys.stderr.write(res.stderr)
+        if res.returncode != 0:
+            die(f"git {step[0]} failed", res.returncode)
+
+
+# --------------------------------------------------------------------------- #
+# argparse wiring
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog=PROG, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(
+        dest="cmd",
+        metavar="{repo,link,unlink,target,status,ls,add,rm,edit,sync}")
+
+    # Shared --repo override for commands that act on the repo.
+    repo_opt = argparse.ArgumentParser(add_help=False)
+    repo_opt.add_argument("--repo", help="snippets repo path (overrides saved "
+                          "config and $LEANSNIP_REPO)")
+    # Shared --dir override for commands that touch editor snippet dirs.
+    dir_opt = argparse.ArgumentParser(add_help=False)
+    dir_opt.add_argument("--dir", help="act on this snippets dir explicitly "
+                         "instead of auto-detecting installed editors")
+
+    pr = sub.add_parser("repo", help="show or set the snippets repo path")
+    pr.add_argument("path", nargs="?", help="existing dir to use as the repo "
+                    "(omit to print the current one)")
+    pr.set_defaults(func=cmd_repo)
+
+    pl = sub.add_parser("link", parents=[repo_opt, dir_opt],
+                        help="symlink lean4.json into installed editors")
+    pl.set_defaults(func=cmd_link)
+
+    pu = sub.add_parser("unlink", parents=[dir_opt],
+                        help="remove leansnip's symlinks")
+    pu.set_defaults(func=cmd_unlink)
+
+    pt = sub.add_parser("target",
+                        help="list/add/remove custom snippet dirs to link into")
+    pt.add_argument("action", nargs="?", choices=["ls", "add", "rm"],
+                    default="ls", help="default: ls")
+    pt.add_argument("path", nargs="?", help="snippets dir (required for add/rm)")
+    pt.set_defaults(func=cmd_target)
+
+    ps = sub.add_parser("status", parents=[repo_opt, dir_opt],
+                        help="show repo, git and per-editor link state")
+    ps.set_defaults(func=cmd_status)
+
+    pls = sub.add_parser("ls", parents=[repo_opt], help="list snippets")
+    pls.set_defaults(func=cmd_ls)
+
+    pa = sub.add_parser("add", parents=[repo_opt],
+                        help="add a snippet (prompts for anything not passed)")
+    pa.add_argument("name", nargs="?", help="snippet name (the label / JSON key)")
+    pa.add_argument("--prefix", help="trigger text (default: the name)")
+    pa.add_argument("--desc", help="optional description")
+    pa.add_argument("--body", action="append", metavar="LINE",
+                    help="one body line; repeat for several, or embed \\n")
+    pa.set_defaults(func=cmd_add)
+
+    prm = sub.add_parser("rm", parents=[repo_opt], help="remove a snippet")
+    prm.add_argument("name", help="snippet name to remove")
+    prm.set_defaults(func=cmd_rm)
+
+    pe = sub.add_parser("edit", parents=[repo_opt],
+                        help="open lean4.json in $EDITOR")
+    pe.set_defaults(func=cmd_edit)
+
+    psy = sub.add_parser("sync", parents=[repo_opt],
+                         help="git pull --rebase --autostash && git push")
+    psy.set_defaults(func=cmd_sync)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        sys.exit(2)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
