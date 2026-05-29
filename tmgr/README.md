@@ -72,8 +72,11 @@ first**, so the session you just left sits under the cursor. Each row carries a
 compact age column (`16s`, `2m`, `1h`, `3d`) showing how long ago you were last
 in it. Sessions with a `.session` file show their description's first line in
 the list and the full description (plus created time, window count, attach state
-and last-attached age) in the `fzf` preview pane. Sessions started with plain
-`tmux new` appear too, marked *untracked*.
+and last-attached age) in the `fzf` preview pane. Below the description, the
+preview tacks on the last ~20 lines of the session's active pane (via `tmux
+capture-pane`), so you can see at a glance what's actually happening in there.
+Sessions started with plain `tmux new` appear too, marked *untracked* — they
+get the tail in their preview as well.
 
 If you're **inside** tmux, `tmgr a` and `tmgr new` use `switch-client` instead
 of `attach` (you can't nest `tmux attach`).

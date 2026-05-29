@@ -243,6 +243,27 @@ def session_info(name):
     return None
 
 
+def session_tail(name, n=20):
+    """Last `n` non-blank lines visible in the session's active pane.
+
+    Returns None if the session isn't running / can't be captured, or [] if the
+    pane is empty. SGR (color/attribute) escapes are preserved via `-e`; fzf's
+    preview renders them as colors.
+    """
+    # `=name` (exact-match prefix) is only valid for session targets; capture-pane
+    # expects a pane target, so we pass the bare name (tmux resolves it to the
+    # session's active window's active pane). `-e` preserves SGR (color/attr)
+    # sequences from the pane — cursor-movement escapes aren't emitted, so the
+    # output renders cleanly in fzf's preview.
+    res = tmux("capture-pane", "-p", "-e", "-t", name, capture=True)
+    if res.returncode != 0:
+        return None
+    lines = res.stdout.rstrip("\n").splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines[-n:] if lines else []
+
+
 def attach(name):
     """Attach to (or, inside tmux, switch to) an existing session, then exit."""
     if in_tmux():
@@ -598,24 +619,33 @@ def cmd_preview(args):
     p = session_path(name)
     if not p.exists():
         print("  tracking : untracked (no .session file)")
-        return
-    try:
-        data = load_session(p)
-    except Exception as e:
-        print(f"  file     : {p}")
-        print(f"  WARNING  : invalid TOML ({e})")
-        return
-    print(f"  created  : {fmt_dt(data.get('created'))}")
-    print(f"  file     : {p}")
-    log = sessionlog_path(name)
-    if log.exists():
-        entries = [ln for ln in log.read_text().splitlines() if ln.strip()]
-        n = len(entries)
-        last = f" — last: {entries[-1]}" if entries else ""
-        print(f"  log      : {n} entr{'y' if n == 1 else 'ies'}{last}")
-    print()
-    desc = (data.get("description") or "").strip()
-    print(desc if desc else "(no description)")
+    else:
+        try:
+            data = load_session(p)
+            print(f"  created  : {fmt_dt(data.get('created'))}")
+            print(f"  file     : {p}")
+            log = sessionlog_path(name)
+            if log.exists():
+                entries = [ln for ln in log.read_text().splitlines() if ln.strip()]
+                n = len(entries)
+                last = f" — last: {entries[-1]}" if entries else ""
+                print(f"  log      : {n} entr{'y' if n == 1 else 'ies'}{last}")
+            print()
+            desc = (data.get("description") or "").strip()
+            print(desc if desc else "(no description)")
+        except Exception as e:
+            print(f"  file     : {p}")
+            print(f"  WARNING  : invalid TOML ({e})")
+
+    # Tail of the session's active pane — shown for any running session, after
+    # the description, so you can see what's actually happening in there.
+    if info:
+        tail = session_tail(name, n=20)
+        if tail:
+            print()
+            print("  ── last lines ──")
+            for line in tail:
+                print(f"  {line}")
 
 
 def cmd_logpreview(args):
