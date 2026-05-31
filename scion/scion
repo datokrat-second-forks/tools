@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""scion - compose Git branches from labeled ranges.
+
+A *scion* is a standalone recipe, stored at .scions/<name>.json, describing how a
+line of work is composed out of ordered ranges of commits. Each range is one of
+three types:
+
+    substrate  carried, fixed commits you don't author
+    essence    your authored payload, identified by a human name (e.g. a PR #)
+    computed   machine-generated commits (carries the command that regenerates)
+
+Every range records its `base` and `tip` as full commit hashes; a range's base
+should equal the previous range's tip. Where it doesn't, the scion is stale at
+that boundary, and operations run only over the healthy prefix below it.
+
+This is the read/edit half. Commands:
+
+    scion new <name> [-m DESC]    create a new, empty scion
+    scion ls                      list the scions in this repo
+    scion show <name>             render a scion's ranges
+    scion health <name>           diagnose health problems (does not fix them)
+    scion mark <name> <range> …   add or update a range
+    scion unmark <name> <range>   remove a range
+
+The `apply` engine (replaying essence onto another scion) is not here yet.
+See ../scion-design.md for the full design.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PROG = "scion"
+SCIONS_DIR = ".scions"
+TYPES = ("substrate", "essence", "computed")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")  # first char alnum, then alnum/_/-
+PIPE = subprocess.PIPE
+
+
+def die(msg, code=1):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# git
+# --------------------------------------------------------------------------- #
+def _git(root, *args):
+    return subprocess.run(["git", "-C", root, *args], text=True, stdout=PIPE, stderr=PIPE)
+
+
+def git_root():
+    res = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                         text=True, stdout=PIPE, stderr=PIPE)
+    if res.returncode != 0:
+        die("not inside a git repository")
+    return res.stdout.strip()
+
+
+def rev_parse(root, rev):
+    """Full hash of <rev>, or die."""
+    res = _git(root, "rev-parse", "--verify", f"{rev}^{{commit}}")
+    if res.returncode != 0:
+        die(f"cannot resolve revision {rev!r}:\n" + res.stderr.rstrip())
+    return res.stdout.strip()
+
+
+def try_resolve(root, rev):
+    """Full hash of <rev>, or None if it doesn't resolve."""
+    if not rev:
+        return None
+    res = _git(root, "rev-parse", "--verify", f"{rev}^{{commit}}")
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def is_ancestor(root, a, b):
+    return _git(root, "merge-base", "--is-ancestor", a, b).returncode == 0
+
+
+def count_commits(root, base, tip):
+    res = _git(root, "rev-list", "--count", f"{base}..{tip}")
+    return int(res.stdout.strip()) if res.returncode == 0 else None
+
+
+# --------------------------------------------------------------------------- #
+# the .scions/<name>.json store
+# --------------------------------------------------------------------------- #
+def valid_name(name):
+    return bool(NAME_RE.fullmatch(name))
+
+
+def scion_path(root, name):
+    return Path(root) / SCIONS_DIR / f"{name}.json"
+
+
+def load(root, name):
+    path = scion_path(root, name)
+    if not path.exists():
+        die(f"no scion named {name!r} (looked in {path})")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        die(f"{path}: invalid JSON: {e}")
+    if not isinstance(data.get("ranges"), list):
+        die(f"{path}: missing a 'ranges' list")
+    return data
+
+
+def save(root, name, data):
+    path = scion_path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def find_range(ranges, name):
+    for i, r in enumerate(ranges):
+        if r.get("name") == name:
+            return i
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# analysis (shared by show + health)
+# --------------------------------------------------------------------------- #
+def analyze(root, ranges):
+    """Per-range facts: resolvability, boundary match, ancestry, commit count,
+    and the linked branch's sync state."""
+    rows = []
+    prev_tip = None
+    for i, r in enumerate(ranges):
+        base, tip = r.get("base"), r.get("tip")
+        base_full = try_resolve(root, base)
+        tip_full = try_resolve(root, tip)
+        row = {
+            "range": r,
+            "tip_resolves": tip is not None and tip_full is not None,
+            "base_resolves": base is None or base_full is not None,
+        }
+        if i == 0:
+            row["boundary_ok"] = True  # the first range roots at the repo root
+        else:
+            row["boundary_ok"] = (base_full is not None
+                                  and base_full == prev_tip)
+        if base_full and tip_full:
+            row["ancestry_ok"] = is_ancestor(root, base_full, tip_full)
+            row["count"] = count_commits(root, base_full, tip_full) if row["ancestry_ok"] else None
+        else:
+            row["ancestry_ok"] = True if base is None else None
+            row["count"] = None
+        branch = r.get("branch")
+        if not branch:
+            row["branch_state"] = "none"
+        else:
+            branch_full = try_resolve(root, branch)
+            row["branch_state"] = (
+                "missing" if branch_full is None
+                else "synced" if tip_full and branch_full == tip_full
+                else "drifted")
+        rows.append(row)
+        prev_tip = tip_full
+    return rows
+
+
+def healthy_through(rows):
+    """Index of the last range in the healthy prefix (-1 if none)."""
+    last = -1
+    for i, row in enumerate(rows):
+        if not row["boundary_ok"]:
+            break
+        last = i
+    return last
+
+
+def range_problems(rows):
+    """(range name, explanation) for every health problem found, top to bottom."""
+    out = []
+    for i, row in enumerate(rows):
+        r = row["range"]
+        name = r.get("name", "?")
+        if not row["tip_resolves"]:
+            out.append((name, f"tip {r.get('tip')!r} does not resolve in this repo"))
+        if not row["base_resolves"]:
+            out.append((name, f"base {r.get('base')!r} does not resolve in this repo"))
+        if row["ancestry_ok"] is False:
+            out.append((name, "base is not an ancestor of tip"))
+        if not row["boundary_ok"]:
+            prev = rows[i - 1]["range"].get("name", "?")
+            out.append((name, f"base ≠ tip of previous range {prev!r} "
+                              f"— replay it here (healthy prefix ends above this)"))
+        if row["branch_state"] == "drifted":
+            out.append((name, f"branch {r.get('branch')!r} has drifted off the range tip"))
+        if row["branch_state"] == "missing":
+            out.append((name, f"branch {r.get('branch')!r} does not exist"))
+        if r.get("type") == "computed" and not r.get("command"):
+            out.append((name, "computed range has no command to regenerate it"))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+def cmd_new(args):
+    root = git_root()
+    if not valid_name(args.name):
+        die(f"invalid scion name {args.name!r} (use letters, digits, '-', '_')")
+    path = scion_path(root, args.name)
+    if path.exists():
+        die(f"scion {args.name!r} already exists ({path})")
+    save(root, args.name, {"description": args.description, "ranges": []})
+    print(f"created scion {args.name!r}")
+
+
+def cmd_ls(args):
+    root = git_root()
+    directory = Path(root) / SCIONS_DIR
+    paths = sorted(directory.glob("*.json")) if directory.is_dir() else []
+    if not paths:
+        print("(no scions)")
+        return
+    for path in paths:
+        try:
+            data = json.loads(path.read_text())
+            ranges = data.get("ranges", [])
+            summary = f"{len(ranges)} range{'' if len(ranges) == 1 else 's'}"
+            desc = (data.get("description") or "").strip().splitlines()
+            tail = f"   {desc[0]}" if desc else ""
+        except (json.JSONDecodeError, OSError):
+            summary, tail = "(unreadable)", ""
+        print(f"  {path.stem:16} {summary:8}{tail}".rstrip())
+
+
+def cmd_show(args):
+    root = git_root()
+    scion = load(root, args.name)
+    rows = analyze(root, scion["ranges"])
+    print(scion.get("description") or args.name)
+    if not rows:
+        print("  (no ranges)")
+        return
+    for row in rows:
+        r = row["range"]
+        n = row["count"]
+        count = "" if n is None else f"{n} commit{'' if n == 1 else 's'}"
+        line = f"  {r.get('type', '?'):9} {r.get('name', '?'):10} {count:>11}"
+        if r.get("branch"):
+            glyph = {"synced": "✓", "drifted": "✗ drifted", "missing": "✗ missing"}
+            line += f"   → {r['branch']} {glyph.get(row['branch_state'], '')}"
+        elif r.get("command"):
+            line += f"   ({r['command']})"
+        notes = []
+        if not row["boundary_ok"]:
+            notes.append("base ≠ previous tip")
+        if not row["tip_resolves"] or not row["base_resolves"]:
+            notes.append("unresolved hash")
+        elif row["ancestry_ok"] is False:
+            notes.append("base not ancestor of tip")
+        if notes:
+            line += "   [" + "; ".join(notes) + "]"
+        print(line.rstrip())
+    healthy = healthy_through(rows)
+    if healthy < len(rows) - 1:
+        bad = rows[healthy + 1]["range"].get("name", "?")
+        print(f"\n  stale at {bad!r}; operations run only up to here "
+              f"(`{PROG} health {args.name}` explains)")
+
+
+def cmd_health(args):
+    root = git_root()
+    scion = load(root, args.name)
+    problems = range_problems(analyze(root, scion["ranges"]))
+    if not problems:
+        print(f"{args.name}: healthy")
+        return
+    print(f"{args.name}: {len(problems)} problem(s)")
+    for name, msg in problems:
+        print(f"  - {name}: {msg}")
+    sys.exit(1)
+
+
+def _apply_optional(r, args):
+    if args.branch is not None:
+        r["branch"] = args.branch
+    if args.command is not None:
+        r["command"] = args.command
+    if args.description is not None:
+        r["description"] = args.description
+
+
+def cmd_mark(args):
+    root = git_root()
+    scion = load(root, args.name)
+    ranges = scion["ranges"]
+    idx = find_range(ranges, args.range)
+
+    if idx is None:                       # add a new range, on top of the stack
+        if not args.type:
+            die("a new range needs --type")
+        if not args.tip:
+            die("a new range needs --tip")
+        r = {"type": args.type, "name": args.range}
+        if args.base is not None:
+            r["base"] = rev_parse(root, args.base)
+        elif ranges and ranges[-1].get("tip"):
+            r["base"] = ranges[-1]["tip"]  # default: sit on the current top
+        r["tip"] = rev_parse(root, args.tip)
+        _apply_optional(r, args)
+        ranges.append(r)
+        verb = "added"
+    else:                                 # update an existing range, found by name
+        r = ranges[idx]
+        if args.type:
+            r["type"] = args.type
+        if args.base is not None:
+            r["base"] = rev_parse(root, args.base)
+        if args.tip is not None:
+            r["tip"] = rev_parse(root, args.tip)
+        _apply_optional(r, args)
+        verb = "updated"
+
+    save(root, args.name, scion)
+    print(f"{verb} {r.get('type', '?')} {r['name']!r} in {args.name}")
+
+
+def cmd_unmark(args):
+    root = git_root()
+    scion = load(root, args.name)
+    idx = find_range(scion["ranges"], args.range)
+    if idx is None:
+        die(f"no range named {args.range!r} in {args.name}")
+    removed = scion["ranges"].pop(idx)
+    save(root, args.name, scion)
+    print(f"removed {removed.get('type', '?')} {args.range!r} from {args.name}")
+
+
+# --------------------------------------------------------------------------- #
+# entry point
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog=PROG, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", metavar="{new,ls,show,health,mark,unmark}")
+
+    pn = sub.add_parser("new", help="create a new, empty scion")
+    pn.add_argument("name")
+    pn.add_argument("-m", "--description", default="", help="what this scion is about")
+    pn.set_defaults(func=cmd_new)
+
+    pl = sub.add_parser("ls", help="list the scions in this repo")
+    pl.set_defaults(func=cmd_ls)
+
+    ps = sub.add_parser("show", help="render a scion's ranges")
+    ps.add_argument("name")
+    ps.set_defaults(func=cmd_show)
+
+    ph = sub.add_parser("health", help="diagnose a scion's problems (doesn't fix them)")
+    ph.add_argument("name")
+    ph.set_defaults(func=cmd_health)
+
+    pm = sub.add_parser("mark", help="add or update a range")
+    pm.add_argument("name", help="scion name")
+    pm.add_argument("range", help="range name (its stable identity)")
+    pm.add_argument("--type", choices=TYPES, help="required when adding a range")
+    pm.add_argument("--tip", help="revision for the range tip (required when adding)")
+    pm.add_argument("--base", help="revision for the range base "
+                                   "(default when adding: the current top range's tip)")
+    pm.add_argument("--branch", help="ref scion keeps pointing at the tip")
+    pm.add_argument("--command", help="regeneration command (for computed ranges)")
+    pm.add_argument("--description")
+    pm.set_defaults(func=cmd_mark)
+
+    pu = sub.add_parser("unmark", help="remove a range")
+    pu.add_argument("name", help="scion name")
+    pu.add_argument("range", help="range name")
+    pu.set_defaults(func=cmd_unmark)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if not getattr(args, "func", None):
+        build_parser().print_help()
+        sys.exit(2)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
