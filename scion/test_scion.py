@@ -68,6 +68,7 @@ class TestCLI(unittest.TestCase):
         self._git("config", "user.email", "t@example.com")
         self._git("config", "user.name", "Test")
         self.commits = [self._commit(f"c{i}") for i in range(5)]
+        self.branch = self._git("rev-parse", "--abbrev-ref", "HEAD")
         r = self._scion("new", "s")
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -104,6 +105,45 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ess["tip"], self.commits[3])
         self.assertEqual(len(ess["tip"]), 40)           # stored in full
         self.assertNotIn("base", data["ranges"][0])     # first range roots at the root
+
+    def test_mark_inserts_out_of_order_and_splits(self):
+        # Mark the ends first, then drop a range into the middle by its tip alone.
+        self._scion("mark", "s", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "s", "top", "--type", "essence", "--tip", self.commits[3])
+        r = self._scion("mark", "s", "mid", "--type", "substrate", "--tip", self.commits[2])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = self._data("s")
+        self.assertEqual([x["name"] for x in data["ranges"]], ["base", "mid", "top"])
+        mid = data["ranges"][1]
+        self.assertEqual(mid["base"], self.commits[1])   # inherits the split range's base
+        self.assertEqual(mid["tip"], self.commits[2])
+        # the succeeding range's base was bumped to the new tip, so it stays consecutive
+        self.assertEqual(data["ranges"][2]["base"], self.commits[2])
+        self.assertEqual(self._scion("health", "s").returncode, 0)
+
+    def test_mark_add_rejected_when_unhealthy(self):
+        self._scion("mark", "s", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "s", "ess", "--type", "essence", "--tip", self.commits[3])
+        self._scion("mark", "s", "base", "--tip", self.commits[2])  # update → boundary breaks
+        r = self._scion("mark", "s", "extra", "--type", "substrate", "--tip", self.commits[4])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("unhealthy", r.stderr)
+
+    def test_mark_rejects_existing_boundary(self):
+        self._scion("mark", "s", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "s", "top", "--type", "essence", "--tip", self.commits[3])
+        r = self._scion("mark", "s", "dup", "--type", "substrate", "--tip", self.commits[1])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already", r.stderr)
+
+    def test_mark_base_crosscheck_mismatch(self):
+        self._scion("mark", "s", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "s", "top", "--type", "essence", "--tip", self.commits[3])
+        # mid splits 'top' (base should be commits[1]); a wrong --base is rejected
+        r = self._scion("mark", "s", "mid", "--type", "substrate",
+                        "--base", self.commits[0], "--tip", self.commits[2])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("doesn't fit", r.stderr)
 
     def test_show_and_health_when_healthy(self):
         self._scion("mark", "s", "base", "--type", "substrate", "--tip", self.commits[1])
@@ -166,10 +206,181 @@ class TestCLI(unittest.TestCase):
         self.assertIn("1 range", r.stdout)   # alpha has one range
         self.assertIn("0 ranges", r.stdout)  # the empty "s" from setUp
 
+    def test_apply_dry_run_plan(self):
+        self._scion("new", "tgt")
+        self._scion("mark", "tgt", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "tgt", "X", "--type", "essence", "--tip", self.commits[2])
+        self._scion("mark", "tgt", "gen", "--type", "computed",
+                    "--tip", self.commits[3], "--command", "echo hi")
+        self._scion("new", "src")
+        self._scion("mark", "src", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "src", "X", "--type", "essence", "--tip", self.commits[4])
+        r = self._scion("apply", "src", "tgt", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("fast-forward", r.stdout)  # source's X is ahead of target's X
+        self.assertIn("regenerate", r.stdout)    # so the computed range rebuilds
+
+    def test_apply_name_mismatch_errors(self):
+        self._scion("new", "a")
+        self._scion("mark", "a", "X", "--type", "essence", "--tip", self.commits[2])
+        self._scion("new", "b")
+        self._scion("mark", "b", "Y", "--type", "essence", "--tip", self.commits[2])
+        r = self._scion("apply", "a", "b", "--dry-run")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("essence names", r.stderr)
+
     def test_unknown_scion_errors(self):
         r = self._scion("show", "nope")
         self.assertEqual(r.returncode, 1)
         self.assertIn("no scion named", r.stderr)
+
+    # ----- apply execution (one step per invocation) ----------------------- #
+    def _apply_state_exists(self):
+        return (self.dir / ".scions" / ".apply.json").exists()
+
+    def test_apply_runs_clean_to_completion(self):
+        # target: base, an essence X behind source's, and a computed range that
+        # rebuilds once X moves. Source fast-forwards X, so X ff's and gen reruns.
+        self._scion("new", "tgt")
+        self._scion("mark", "tgt", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "tgt", "X", "--type", "essence", "--tip", self.commits[2])
+        self._scion("mark", "tgt", "gen", "--type", "computed", "--tip", self.commits[3],
+                    "--command", "echo z >> f && git add f && git commit -q -m gen")
+        self._scion("new", "src")
+        self._scion("mark", "src", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "src", "X", "--type", "essence", "--tip", self.commits[4])
+
+        r = self._scion("apply", "src", "tgt")  # start: records the plan, no step yet
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self._apply_state_exists())
+
+        last = None
+        for _ in range(6):  # base (keep) → X (ff) → gen (regen): three continues
+            last = self._scion("apply", "--continue")
+            self.assertEqual(last.returncode, 0, last.stderr)
+            if "complete" in last.stdout:
+                break
+        self.assertIn("complete", last.stdout)
+        self.assertFalse(self._apply_state_exists())               # state cleared
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD"), self.branch)
+
+        data = self._data("tgt")
+        x = next(r for r in data["ranges"] if r["name"] == "X")
+        self.assertEqual(x["tip"], self.commits[4])                # X fast-forwarded
+        gen = next(r for r in data["ranges"] if r["name"] == "gen")
+        self.assertEqual(gen["base"], self.commits[4])             # rebuilt on the new X
+        self.assertNotEqual(gen["tip"], self.commits[3])           # and regenerated
+
+    def test_apply_conflict_then_resume(self):
+        # Construct a guaranteed conflict: source rewrites essence X's line, then
+        # target's upper substrate (which edits the same line) replays onto it.
+        def commit(msg, content):
+            (self.dir / "g").write_text(content)
+            self._git("add", "g")
+            self._git("commit", "-q", "-m", msg)
+            return self._git("rev-parse", "HEAD")
+
+        c0 = commit("g0", "hello\n")
+        cx = commit("gX", "hello-X\n")          # target's essence X
+        cc = commit("gcollab", "hello-X-collab\n")  # target's upper substrate
+        self._git("checkout", "-q", c0)
+        sx = commit("gsrc", "hello-SRC\n")      # source's essence X, diverged from cx
+        self._git("checkout", "-q", self.branch)
+
+        self._scion("new", "tgt")
+        self._scion("mark", "tgt", "base", "--type", "substrate", "--tip", c0)
+        self._scion("mark", "tgt", "X", "--type", "essence", "--tip", cx)
+        self._scion("mark", "tgt", "collab", "--type", "substrate", "--tip", cc)
+        self._scion("new", "src")
+        self._scion("mark", "src", "base", "--type", "substrate", "--tip", c0)
+        self._scion("mark", "src", "X", "--type", "essence", "--tip", sx)
+
+        self.assertEqual(self._scion("apply", "src", "tgt").returncode, 0)
+        self.assertEqual(self._scion("apply", "--continue").returncode, 0)  # base keep
+        self.assertEqual(self._scion("apply", "--continue").returncode, 0)  # X clean
+        conflict = self._scion("apply", "--continue")                       # collab → conflict
+        self.assertEqual(conflict.returncode, 1)
+        self.assertIn("conflict", (conflict.stdout + conflict.stderr).lower())
+        self.assertTrue(self._apply_state_exists())                # paused, not lost
+
+        # resolve by hand, then continue — the cherry-pick finishes and apply ends
+        (self.dir / "g").write_text("resolved\n")
+        self._git("add", "g")
+        done = self._scion("apply", "--continue")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("complete", done.stdout)
+        self.assertFalse(self._apply_state_exists())
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD"), self.branch)
+        # the resolved content is what landed on the rebuilt collab tip
+        collab_tip = next(r for r in self._data("tgt")["ranges"] if r["name"] == "collab")["tip"]
+        self.assertEqual(self._git("show", f"{collab_tip}:g"), "resolved")
+
+    def test_apply_abort_restores_checkout(self):
+        self._scion("new", "tgt")
+        self._scion("mark", "tgt", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "tgt", "X", "--type", "essence", "--tip", self.commits[2])
+        self._scion("new", "src")
+        self._scion("mark", "src", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "src", "X", "--type", "essence", "--tip", self.commits[4])
+
+        self._scion("apply", "src", "tgt")           # start
+        self._scion("apply", "--continue")           # base keep → detaches HEAD
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD"), "HEAD")  # detached
+        r = self._scion("apply", "--abort")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD"), self.branch)
+        self.assertFalse(self._apply_state_exists())
+        x = next(r for r in self._data("tgt")["ranges"] if r["name"] == "X")
+        self.assertEqual(x["tip"], self.commits[2])  # target left untouched
+
+    def test_apply_by_hand_overrides_action(self):
+        self._scion("new", "tgt")
+        self._scion("mark", "tgt", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "tgt", "X", "--type", "essence", "--tip", self.commits[2])
+        self._scion("new", "src")
+        self._scion("mark", "src", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "src", "X", "--type", "essence", "--tip", self.commits[4])
+        self.assertEqual(self._scion("apply", "src", "tgt").returncode, 0)
+
+        refused = self._scion("apply", "--by-hand")        # the base is a keep
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("nothing to do by hand", refused.stderr)
+
+        self.assertEqual(self._scion("apply", "--continue").returncode, 0)  # base
+
+        setup = self._scion("apply", "--by-hand")          # take X over rather than ff
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        self.assertIn("by hand", setup.stdout)
+        self.assertEqual(self._git("rev-parse", "refs/scion/tgt/new"), self.commits[4])
+
+        (self.dir / "m").write_text("manual result")       # build something of my own
+        self._git("add", "m")
+        self._git("commit", "-q", "-m", "manual")
+        custom = self._git("rev-parse", "HEAD")
+
+        done = self._scion("apply", "--continue")          # record HEAD as X's tip
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("complete", done.stdout)
+        x = next(r for r in self._data("tgt")["ranges"] if r["name"] == "X")
+        self.assertEqual(x["tip"], custom)                 # mine, not source's commits[4]
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD"), self.branch)
+
+    def test_apply_continue_without_start_errors(self):
+        r = self._scion("apply", "--continue")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no apply in progress", r.stderr)
+
+    def test_apply_ignores_untracked_files(self):
+        self._scion("new", "tgt")
+        self._scion("mark", "tgt", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "tgt", "X", "--type", "essence", "--tip", self.commits[2])
+        self._scion("new", "src")
+        self._scion("mark", "src", "base", "--type", "substrate", "--tip", self.commits[1])
+        self._scion("mark", "src", "X", "--type", "essence", "--tip", self.commits[4])
+        (self.dir / "scratch.txt").write_text("untracked, should not block apply")
+        r = self._scion("apply", "src", "tgt")   # an untracked file is present
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self._apply_state_exists())
 
 
 if __name__ == "__main__":

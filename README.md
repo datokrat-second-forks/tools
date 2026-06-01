@@ -14,7 +14,7 @@ Note: I'm using these inside a heavily restrained sandbox, and they were develop
 | [`floodgate`](floodgate/) | Review a branch diff in the browser: serves an HTML diff with per-hunk accept/reject/skip buttons, persists marks to a `.review` file so reviews are resumable, and supports bulk-marking via diffkit's `filter-diff`. |
 | [`leansnip`](leansnip/) | Manage VSCode Lean 4 snippets from a single git repo: keeps `lean4.json` in a repo you own and symlinks it into each installed editor's user-snippets dir, so the repo stays the source of truth while VSCode edits write straight back. |
 | [`lean-infoview-cors`](lean-infoview-cors/) | Patch the Lean 4 VS Code extension's bundled `extension.js` to add `crossorigin="anonymous"` to the InfoView stylesheet link, so the InfoView renders styled under code-server. Idempotent; reapply after each extension upgrade. |
-| [`scion`](scion/) | Describe a stack of Git branches as labeled ranges (substrate / essence / computed) in a `.scions/` manifest, then inspect, health-check, and edit them; replaying your essential changes onto another branch (`apply`) is in progress. |
+| [`scion`](scion/) | Describe a stack of Git branches as labeled ranges (substrate / essence / computed) in a `.scions/` manifest; inspect, health-check, and edit them, then `apply` one scion's essence onto another, one reviewable step at a time. |
 
 ## Layout
 

@@ -122,46 +122,58 @@ Diagnose and explain the scion's problems — it only diagnoses; fixing is by ha
 - **broken ranges** — a `base`/`tip` that doesn't resolve, or a `base` that isn't
   an ancestor of its `tip`.
 
-### `scion mark <name> …` / `scion unmark <name> <range>`
+### `scion mark <name> <range> …` / `scion unmark <name> <range>`
 
-Add/update or remove a range of any type (substrate included). `mark` creates the
-scion if it doesn't exist. Hand-editing the JSON stays a first-class path.
+Add, update, or remove a range of any type (substrate included). Marks needn't be
+made bottom-up: when adding, `mark` infers the range's place from where its `--tip`
+falls — above the stack it goes on top, inside an existing range it splits that one
+and bumps the **succeeding range's base** to the new tip so the chain stays
+consecutive. That inference only holds on a healthy scion, so adding to an unhealthy
+one is refused (`scion health` explains; repair via `mark`'s in-place update first,
+which is the one path left untouched by the health gate). `mark` doesn't create a
+scion — use `scion new`. Hand-editing the JSON stays a first-class path.
 
-### `scion apply <source> <target> [--dry-run]`
+### `scion apply <source> <target>`
 
 Bring `source`'s essence work onto `target`'s composition. Requires `source` and
-`target` to have the **same sequence of essence names** (equality). scion
-rebuilds `target` bottom-up, over its healthy prefix:
+`target` to have the **same sequence of essence names** (equality). scion rebuilds
+`target` bottom-up, over its healthy prefix:
 
 - **substrate** → keep `target`'s, replayed onto whatever changed below it;
 - **essence "N"** → replace with `source`'s "N";
 - **computed** → regenerate by re-running its `command`.
 
-It stops at the first base/tip mismatch (replay it by hand, then continue).
-Linked branches are updated to follow the new tips. `--dry-run` prints the plan
-without touching anything.
+`target` must be healthy first; a stale boundary aborts the apply with a pointer
+to `scion health` (you replay the stale range by hand, then apply). Linked
+branches are force-updated to follow the new tips, with their old tips backed up
+under `refs/scion/backup/<target>/`. `--dry-run` prints the plan without touching
+anything.
 
 This single operation also covers "rebase onto a newer base": build a fresh
 `target` scion on the new base (same essence names), then `apply` your working
 scion onto it.
 
-#### The apply wizard
+#### Stepping through an apply
 
-Interactive by default. For each essence range that isn't already a clean
-fast-forward:
+The human stays in the loop before every step. `scion apply <source> <target>`
+records the plan and stops without changing anything. Each `scion apply
+--continue` then performs exactly one step — fast-forward, cherry-pick,
+regenerate, or keep — prints what it did and what comes next, and exits. Between
+steps you resume with `--continue`, leave the half-built result as it is, or
+`scion apply --abort` to return to where you started. One apply runs at a time.
 
-```
-essence 12982: target has v1, source has v2 — how to apply?
-  [f] fast-forward (when valid)   [r] rebase source's commits onto the rebuilt base
-  [h] solve by hand               [s] skip   [q] quit
-```
+A step that conflicts leaves the working tree conflicted, exactly like an ordinary
+cherry-pick: resolve it, `git add`, and `--continue` finishes that step and moves
+on. For reference it parks the commits being replayed at `refs/scion/<target>/new`
+(and, for an essence range, the target's prior version at `/old`). Only tracked
+changes block an apply — untracked files are ignored.
 
-**Solve by hand** checks out the rebuilt base and leaves two refs —
-`scion/<target>/old` (target's current version of the range) and
-`scion/<target>/new` (source's version) — then exits. Finish however you like,
-leave the result on `HEAD`, and `scion apply --continue [<target>]` records it
-and moves on. Conflicts in the `[r]` path resume the same way. The refs and saved
-progress are namespaced by `<target>`, so two applies can be in flight at once.
+scion chooses each step's action for you — fast-forward when it can, cherry-pick
+when it must, regenerate computed ranges. To decide for yourself, run `scion apply
+--by-hand` in place of `--continue`: it parks those same `refs/scion/<target>/`
+refs, leaves HEAD on the rebuilt base, and stops. Build the range however you
+like — cherry-pick `…/new`, take a subset, edit, whatever — commit, then `scion
+apply --continue` records your HEAD as the range's tip and carries on.
 
 ## Invariants
 

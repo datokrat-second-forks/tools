@@ -13,7 +13,7 @@ Every range records its `base` and `tip` as full commit hashes; a range's base
 should equal the previous range's tip. Where it doesn't, the scion is stale at
 that boundary, and operations run only over the healthy prefix below it.
 
-This is the read/edit half. Commands:
+Commands:
 
     scion new <name> [-m DESC]    create a new, empty scion
     scion ls                      list the scions in this repo
@@ -21,13 +21,18 @@ This is the read/edit half. Commands:
     scion health <name>           diagnose health problems (does not fix them)
     scion mark <name> <range> …   add or update a range
     scion unmark <name> <range>   remove a range
+    scion apply <src> <tgt>       replay src's essence onto tgt, one step at a time
+    scion apply --continue        do the next step — or --by-hand to apply it yourself
 
-The `apply` engine (replaying essence onto another scion) is not here yet.
+`apply` keeps you in the loop: it does one step, prints the status, and exits. You
+resume with --continue (or --by-hand to apply that step yourself), leave things as
+they are, or --abort. --dry-run previews the plan.
 See ../scion-design.md for the full design.
 """
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,6 +40,7 @@ from pathlib import Path
 
 PROG = "scion"
 SCIONS_DIR = ".scions"
+APPLY_STATE = ".apply.json"   # an in-progress apply, under .scions/
 TYPES = ("substrate", "essence", "computed")
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")  # first char alnum, then alnum/_/-
 PIPE = subprocess.PIPE
@@ -83,6 +89,13 @@ def is_ancestor(root, a, b):
 def count_commits(root, base, tip):
     res = _git(root, "rev-list", "--count", f"{base}..{tip}")
     return int(res.stdout.strip()) if res.returncode == 0 else None
+
+
+def git_or_die(root, *args):
+    res = _git(root, *args)
+    if res.returncode != 0:
+        die(f"git {' '.join(args)} failed:\n{res.stderr.rstrip()}")
+    return res.stdout.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +212,295 @@ def range_problems(rows):
     return out
 
 
+def chain_broken(rows):
+    """True if the ranges aren't a clean consecutive chain. Looks only at the
+    structure (resolvability, ancestry, boundaries) — branch drift and missing
+    commands are health problems but don't affect where a new range slots in."""
+    return any(not row["tip_resolves"] or not row["base_resolves"]
+               or row["ancestry_ok"] is False or not row["boundary_ok"]
+               for row in rows)
+
+
+def essence_names(scion):
+    return [r.get("name") for r in scion["ranges"] if r.get("type") == "essence"]
+
+
+def plan_apply(root, source, target):
+    """Plan applying source's essence onto target. Returns (steps, stop): a list
+    of step dicts over target's healthy prefix, and the first stale range's index
+    (or None if the whole scion is healthy).
+
+    Walking bottom-up, `dirty` tracks whether something below has changed, forcing
+    the rest to rebuild. Each step carries what execution needs: an `action` plus
+    a `tip` to move HEAD to, a `pick` range to cherry-pick, or a `command` to run.
+    The base stays; an essence range takes source's version; a computed range
+    regenerates; substrate above a change replays."""
+    if essence_names(source) != essence_names(target):
+        die("source and target must share the same sequence of essence names:\n"
+            f"  source: {essence_names(source)}\n  target: {essence_names(target)}")
+    src = {r["name"]: r for r in source["ranges"] if r.get("type") == "essence"}
+    rows = analyze(root, target["ranges"])
+    stop = healthy_through(rows) + 1  # first stale range, or len(ranges) if healthy
+
+    steps, dirty = [], False
+    for i, r in enumerate(target["ranges"][:stop]):
+        typ = r.get("type")
+        s = {"name": r.get("name"), "type": typ, "branch": r.get("branch")}
+        if i == 0:
+            s.update(action="keep", tip=r.get("tip"), detail="base of the stack")
+        elif typ == "essence":
+            sr = src[s["name"]]
+            if not dirty and sr.get("tip") == r.get("tip"):
+                s.update(action="keep", tip=r.get("tip"), detail="already matches source")
+            elif not dirty and is_ancestor(root, r["tip"], sr["tip"]):
+                s.update(action="fast-forward", tip=sr["tip"], old=r.get("tip"), new=sr["tip"],
+                         detail=f"to {sr['tip'][:7]}")
+                dirty = True
+            else:
+                n = count_commits(root, sr.get("base"), sr.get("tip"))
+                onto = "the rebuilt base" if dirty else (r.get("base") or "")[:7]
+                s.update(action="rebase", pick=[sr.get("base"), sr.get("tip")],
+                         old=r.get("tip"), new=sr.get("tip"),
+                         detail=f"source's {n} commit(s) onto {onto}"
+                                + (" (may conflict)" if dirty else ""))
+                dirty = True
+        elif typ == "computed":
+            if dirty:
+                s.update(action="regenerate", command=r.get("command"), new=r.get("tip"),
+                         detail=f"run: {r.get('command') or '(no command!)'}")
+                dirty = True
+            else:
+                s.update(action="keep", tip=r.get("tip"), detail="input unchanged")
+        else:  # substrate
+            if dirty:
+                s.update(action="replay", pick=[r.get("base"), r.get("tip")], new=r.get("tip"),
+                         detail="rebase onto the rebuilt base")
+            else:
+                s.update(action="keep", tip=r.get("tip"), detail="unchanged")
+        steps.append(s)
+    return steps, (stop if stop < len(target["ranges"]) else None)
+
+
+# --------------------------------------------------------------------------- #
+# apply execution — one step per invocation, state in .scions/.apply.json
+#
+# `apply <src> <tgt>` records the plan and stops; each `apply --continue` does
+# exactly one step, prints the new status, and exits. Between steps the human can
+# resume, leave things as they are, or `apply --abort`. A conflicting step simply
+# stops with the working tree conflicted; you resolve, `git add`, and continue.
+# --------------------------------------------------------------------------- #
+def apply_state_path(root):
+    return Path(root) / SCIONS_DIR / APPLY_STATE
+
+
+def load_apply_state(root):
+    path = apply_state_path(root)
+    if not path.exists():
+        die(f"no apply in progress (start one with `{PROG} apply <src> <tgt>`)")
+    return json.loads(path.read_text())
+
+
+def save_apply_state(root, state):
+    apply_state_path(root).write_text(json.dumps(state, indent=2) + "\n")
+
+
+def working_tree_clean(root):
+    """Clean enough to rebase on. Only tracked changes block an apply; untracked
+    files — build artifacts, scratch, scion's own .scions/ — are always ignored."""
+    return not _git(root, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+
+
+def current_ref(root):
+    """The branch HEAD is on, or its commit hash when detached."""
+    res = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    return res.stdout.strip() if res.returncode == 0 else rev_parse(root, "HEAD")
+
+
+def cherry_pick_in_progress(root):
+    return _git(root, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD").returncode == 0
+
+
+def set_ref(root, ref, sha):
+    _git(root, "update-ref", ref, sha)
+
+
+def del_ref(root, ref):
+    _git(root, "update-ref", "-d", ref)
+
+
+def park_refs(root, target, step):
+    """Park reference refs for a range handled in conflict or by hand; return a
+    short hint naming what was created (empty if the step carries no endpoints)."""
+    hints = []
+    if step.get("old"):
+        set_ref(root, f"refs/scion/{target}/old", step["old"])
+        hints.append(f"scion/{target}/old = target's previous {step['name']!r}")
+    if step.get("new"):
+        set_ref(root, f"refs/scion/{target}/new", step["new"])
+        hints.append(f"scion/{target}/new = the commits to apply")
+    return "; ".join(hints)
+
+
+def print_plan(source, target, steps, stop, target_scion):
+    print(f"apply {source} → {target}")
+    for s in steps:
+        print(f"  {s['action']:12} {s.get('type', ''):9} {s['name']:10} {s['detail']}")
+    if stop is not None:
+        bad = target_scion["ranges"][stop].get("name", "?")
+        print(f"  … stops at {bad!r} — stale boundary; fix with `{PROG} health {target}`")
+
+
+def apply_start(root, args):
+    if apply_state_path(root).exists():
+        die(f"an apply is already in progress; `{PROG} apply --continue` or `--abort` it first")
+    source = load(root, args.source)
+    target = load(root, args.target)
+    steps, stop = plan_apply(root, source, target)
+    if args.dry_run:
+        print_plan(args.source, args.target, steps, stop, target)
+        return
+    if stop is not None:
+        die(f"{args.target!r} is stale; fix it with `{PROG} health {args.target}` before applying")
+    if not working_tree_clean(root):
+        die("working tree is not clean; commit or stash first")
+    backups = {}
+    for s in steps:
+        tip = try_resolve(root, s["branch"]) if s.get("branch") else None
+        if tip:
+            set_ref(root, f"refs/scion/backup/{args.target}/{s['branch']}", tip)
+            backups[s["branch"]] = tip
+    save_apply_state(root, {"source": args.source, "target": args.target, "steps": steps,
+                            "index": 0, "tips": {}, "original": current_ref(root),
+                            "backups": backups})
+    print_plan(args.source, args.target, steps, stop, target)
+    print(f"\nstarted. `{PROG} apply --continue` does the next step "
+          f"(`--by-hand` to apply it yourself); `--abort` undoes it.")
+
+
+def apply_continue(root, by_hand=False):
+    state = load_apply_state(root)
+
+    if state.get("manual"):            # recording a range you took over by hand
+        cur = state["steps"][state["index"]]
+        if by_hand:
+            die(f"already taking {cur['name']!r} by hand; build it, then `{PROG} apply --continue`")
+        if not working_tree_clean(root):
+            die(f"commit your result first, or `{PROG} apply --abort`")
+        state["manual"] = False
+        finish_step(root, state)
+        return report(root, state)
+
+    if cherry_pick_in_progress(root):  # resuming a conflict you resolved by hand
+        res = subprocess.run(["git", "-C", root, "cherry-pick", "--continue"],
+                             text=True, stdout=PIPE, stderr=PIPE,
+                             env={**os.environ, "GIT_EDITOR": "true"})
+        if res.returncode != 0:
+            print(f"still conflicted — resolve, `git add`, then `{PROG} apply --continue` "
+                  f"(or `{PROG} apply --abort`).")
+            sys.exit(1)
+        finish_step(root, state)
+        return report(root, state)
+
+    steps, i = state["steps"], state["index"]
+    if i >= len(steps):
+        die("apply already complete")
+    s = steps[i]
+    action = s["action"]
+
+    if by_hand:                        # take this range over yourself
+        if action == "keep":
+            die(f"{s['name']!r} is kept as-is — nothing to do by hand; run `{PROG} apply --continue`")
+        hint = park_refs(root, state["target"], s)
+        state["manual"] = True
+        save_apply_state(root, state)
+        print(f"taking {s['name']!r} by hand — HEAD is at {rev_parse(root, 'HEAD')[:7]}, the rebuilt base.")
+        print(f"build it however you like, commit, then `{PROG} apply --continue` to record HEAD as its tip.")
+        print(f"  ({hint + '; ' if hint else ''}`{PROG} apply --abort` to cancel)")
+        return
+    if action in ("keep", "fast-forward"):
+        if not working_tree_clean(root):
+            die(f"working tree is not clean; commit, stash, or `{PROG} apply --abort`")
+        git_or_die(root, "checkout", "-q", "--detach", s["tip"])
+    elif action in ("rebase", "replay"):
+        if _git(root, "cherry-pick", f"{s['pick'][0]}..{s['pick'][1]}").returncode != 0:
+            hint = park_refs(root, state["target"], s)
+            print(f"conflict replaying {s['name']!r}. resolve it, `git add`, then "
+                  f"`{PROG} apply --continue` (or `--abort`).")
+            if hint:
+                print(f"  ({hint})")
+            sys.exit(1)
+    elif action == "regenerate":
+        if not s.get("command"):
+            die(f"computed range {s['name']!r} has no command to run")
+        if subprocess.run(s["command"], shell=True, cwd=root).returncode != 0 \
+                or not working_tree_clean(root):
+            print(f"generator for {s['name']!r} failed or left changes; "
+                  f"fix it, then `{PROG} apply --continue` (or `--abort`).")
+            sys.exit(1)
+    finish_step(root, state)
+    return report(root, state)
+
+
+def finish_step(root, state):
+    """Record the just-finished range's new tip, advance, and finalize if done."""
+    i = state["index"]
+    state["tips"][state["steps"][i]["name"]] = rev_parse(root, "HEAD")
+    state["index"] = i + 1
+    save_apply_state(root, state)
+    if state["index"] >= len(state["steps"]):
+        finalize_apply(root, state)
+
+
+def report(root, state):
+    steps, i = state["steps"], state["index"]
+    if i >= len(steps):
+        return  # finalize already printed the closing summary
+    nxt = steps[i]
+    print(f"did {steps[i - 1]['name']!r}; HEAD now at {rev_parse(root, 'HEAD')[:7]}.")
+    print(f"next: {nxt['action']} {nxt['name']!r} — {nxt['detail']}")
+    cont = f"`{PROG} apply --continue`"
+    if nxt["action"] != "keep":
+        cont += " (or `--by-hand` to apply it yourself)"
+    print(f"{cont}, leave it as is, or `{PROG} apply --abort`.")
+
+
+def finalize_apply(root, state):
+    """Write the rebuilt tips back into the target, move its linked branches to
+    follow, return to the original checkout, and clear the apply state."""
+    target = load(root, state["target"])
+    tips, prev = state["tips"], None
+    for r in target["ranges"]:
+        name = r.get("name")
+        if name in tips:
+            if prev is not None:
+                r["base"] = prev
+            r["tip"] = tips[name]
+        prev = r.get("tip")
+    save(root, state["target"], target)
+    for r in target["ranges"]:
+        if r.get("branch") and r.get("name") in tips:
+            set_ref(root, f"refs/heads/{r['branch']}", tips[r["name"]])
+    git_or_die(root, "checkout", "-q", state["original"])
+    for suffix in ("old", "new"):
+        del_ref(root, f"refs/scion/{state['target']}/{suffix}")
+    apply_state_path(root).unlink(missing_ok=True)
+    print(f"apply complete: {state['source']} → {state['target']}. back on "
+          f"{state['original']}; old branch tips saved under refs/scion/backup/{state['target']}/.")
+
+
+def apply_abort(root):
+    state = load_apply_state(root)
+    if cherry_pick_in_progress(root):
+        _git(root, "cherry-pick", "--abort")
+    git_or_die(root, "checkout", "-q", "-f", state["original"])
+    for suffix in ("old", "new"):
+        del_ref(root, f"refs/scion/{state['target']}/{suffix}")
+    for branch in state.get("backups", {}):
+        del_ref(root, f"refs/scion/backup/{state['target']}/{branch}")
+    apply_state_path(root).unlink(missing_ok=True)
+    print(f"apply aborted; back on {state['original']}.")
+
+
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
@@ -295,21 +597,7 @@ def cmd_mark(args):
     ranges = scion["ranges"]
     idx = find_range(ranges, args.range)
 
-    if idx is None:                       # add a new range, on top of the stack
-        if not args.type:
-            die("a new range needs --type")
-        if not args.tip:
-            die("a new range needs --tip")
-        r = {"type": args.type, "name": args.range}
-        if args.base is not None:
-            r["base"] = rev_parse(root, args.base)
-        elif ranges and ranges[-1].get("tip"):
-            r["base"] = ranges[-1]["tip"]  # default: sit on the current top
-        r["tip"] = rev_parse(root, args.tip)
-        _apply_optional(r, args)
-        ranges.append(r)
-        verb = "added"
-    else:                                 # update an existing range, found by name
+    if idx is not None:                   # update in place — also the by-hand repair path
         r = ranges[idx]
         if args.type:
             r["type"] = args.type
@@ -318,10 +606,57 @@ def cmd_mark(args):
         if args.tip is not None:
             r["tip"] = rev_parse(root, args.tip)
         _apply_optional(r, args)
-        verb = "updated"
+        save(root, args.name, scion)
+        print(f"updated {r.get('type', '?')} {r['name']!r} in {args.name}")
+        return
 
+    # --- add a new range ------------------------------------------------- #
+    # We slot it in by where its tip falls, so marks needn't be made bottom-up.
+    # That inference only holds on a consecutive, ordered (i.e. healthy) scion.
+    if not args.type:
+        die("a new range needs --type")
+    if not args.tip:
+        die("a new range needs --tip")
+    if chain_broken(analyze(root, ranges)):
+        die(f"{args.name} is unhealthy — fix it first (`{PROG} health {args.name}`)")
+
+    tip = rev_parse(root, args.tip)
+    base_arg = rev_parse(root, args.base) if args.base is not None else None
+    r = {"type": args.type, "name": args.range}
+    _apply_optional(r, args)
+
+    boundaries = {b for rr in ranges for b in (rr.get("base"), rr.get("tip")) if b}
+    if not ranges:                        # first range: roots at --base (or the repo root)
+        base, succ, where = base_arg, None, "as the first range"
+    elif tip in boundaries:
+        die(f"a range already starts or ends at {tip[:7]}; "
+            f"update that one instead of adding a new range")
+    else:
+        # the new tip splits the lowest range it's an ancestor of; above all → on top
+        succ = next((i for i, rr in enumerate(ranges)
+                     if is_ancestor(root, tip, rr["tip"])), None)
+        if succ is None:
+            base, where = ranges[-1].get("tip"), "on top"
+        else:
+            base, where = ranges[succ].get("base"), f"below {ranges[succ].get('name', '?')!r}"
+
+    if base_arg is not None and base_arg != base:
+        die(f"--base {base_arg[:7]} doesn't fit there (expected {base[:7] if base else 'the root'})")
+
+    if base is not None:
+        r["base"] = base
+    r["tip"] = tip
+    if succ is None:
+        ranges.append(r)
+    else:
+        ranges.insert(succ, r)
+        ranges[succ + 1]["base"] = tip    # the succeeding range now starts at the new tip
+
+    if chain_broken(analyze(root, ranges)):
+        die(f"that tip doesn't sit cleanly inside {args.name} — it would break the chain "
+            f"(pick a commit within one range)")
     save(root, args.name, scion)
-    print(f"{verb} {r.get('type', '?')} {r['name']!r} in {args.name}")
+    print(f"added {r.get('type', '?')} {r['name']!r} to {args.name} {where}")
 
 
 def cmd_unmark(args):
@@ -335,6 +670,20 @@ def cmd_unmark(args):
     print(f"removed {removed.get('type', '?')} {args.range!r} from {args.name}")
 
 
+def cmd_apply(args):
+    root = git_root()
+    if args.abort:
+        apply_abort(root)
+    elif args.by_hand:
+        apply_continue(root, by_hand=True)
+    elif args.cont:
+        apply_continue(root)
+    elif args.source and args.target:
+        apply_start(root, args)
+    else:
+        die("usage: scion apply <src> <tgt> [--dry-run] | --continue [--by-hand] | --abort")
+
+
 # --------------------------------------------------------------------------- #
 # entry point
 # --------------------------------------------------------------------------- #
@@ -342,7 +691,7 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog=PROG, description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", metavar="{new,ls,show,health,mark,unmark}")
+    sub = p.add_subparsers(dest="cmd", metavar="{new,ls,show,health,mark,unmark,apply}")
 
     pn = sub.add_parser("new", help="create a new, empty scion")
     pn.add_argument("name")
@@ -364,9 +713,10 @@ def build_parser():
     pm.add_argument("name", help="scion name")
     pm.add_argument("range", help="range name (its stable identity)")
     pm.add_argument("--type", choices=TYPES, help="required when adding a range")
-    pm.add_argument("--tip", help="revision for the range tip (required when adding)")
-    pm.add_argument("--base", help="revision for the range base "
-                                   "(default when adding: the current top range's tip)")
+    pm.add_argument("--tip", help="revision for the range tip (required when adding; "
+                                  "its position in the stack is inferred from where it falls)")
+    pm.add_argument("--base", help="revision for the range base — for the first range, "
+                                   "or as a cross-check on an inferred insert position")
     pm.add_argument("--branch", help="ref scion keeps pointing at the tip")
     pm.add_argument("--command", help="regeneration command (for computed ranges)")
     pm.add_argument("--description")
@@ -376,6 +726,19 @@ def build_parser():
     pu.add_argument("name", help="scion name")
     pu.add_argument("range", help="range name")
     pu.set_defaults(func=cmd_unmark)
+
+    pa = sub.add_parser("apply", help="replay source's essence onto target, one step at a time")
+    pa.add_argument("source", nargs="?")
+    pa.add_argument("target", nargs="?")
+    pa.add_argument("--dry-run", action="store_true",
+                    help="show the plan without changing anything")
+    pa.add_argument("--continue", dest="cont", action="store_true",
+                    help="perform the next step of an apply in progress")
+    pa.add_argument("--by-hand", dest="by_hand", action="store_true",
+                    help="take the next step over yourself instead of letting scion apply it")
+    pa.add_argument("--abort", action="store_true",
+                    help="undo an apply in progress and return to where you were")
+    pa.set_defaults(func=cmd_apply)
     return p
 
 
