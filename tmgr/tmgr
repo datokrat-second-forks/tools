@@ -8,6 +8,7 @@ Commands:
     tmgr new <name> [-m DESC]   create + attach to a session (tracks it)
     tmgr edit <name>            edit a session's .session file in $EDITOR/vim
     tmgr a [name]               attach to <name>, or fuzzy-pick one (fzf)
+    tmgr pick [--all]           fuzzy-pick a session and print its name (no attach)
     tmgr rm <name>              delete a non-running session's tracking files
     tmgr log [text]             append a timestamped log entry (inside tmux)
     tmgr logs [name]            show a session log (fzf-pick, or pass a name)
@@ -458,11 +459,34 @@ def cmd_a(args):
     if not sessions:
         print("No running tmux sessions. Start one with: tmgr new <name>")
         return
+    name = pick_session(sessions)
+    if name:
+        attach(name)
 
-    # Most-recently-attached first, with a compact age column so the session you
-    # just left sits under the cursor instead of needing a visual scan. The bare
-    # name is kept as a hidden first field for the preview and for parsing; the
-    # pre-formatted, aligned display goes in field 2.
+
+def all_sessions_recent():
+    """(name, last_attached_epoch) for running sessions (most-recent first),
+    then tracked remnants that aren't running (epoch 0, so they sort/label as
+    '--'). This is the `tmgr ls --all` set, shaped for the picker."""
+    running = running_sessions_recent()
+    live = {name for name, _ in running}
+    out = list(running)
+    if TMGR_DIR.exists():
+        for f in sorted(TMGR_DIR.glob("*.session")):
+            name = f.name[: -len(".session")]
+            if name not in live:
+                out.append((name, 0))
+    return out
+
+
+def pick_session(sessions, query=None):
+    """Fuzzy-pick from (name, last_attached) pairs and return the chosen name
+    (or None if cancelled). Shared by `tmgr a` and `tmgr pick`. `query`, if
+    given, pre-fills the fzf search so a matching session starts selected.
+
+    A compact age column puts the session you just left under the cursor; the
+    bare name is a hidden first field (for the preview and for parsing) and the
+    aligned display goes in field 2."""
     width = max(len(name) for name, _ in sessions)
     lines = []
     for name, last_attached in sessions:
@@ -476,12 +500,25 @@ def cmd_a(args):
             desc = "(untracked)"
         display = f"{rel_age(last_attached):<4} {name:<{width}}  {desc}".rstrip()
         lines.append(f"{name}\t{display}")
+    choice = pick(lines, with_nth="2", query=query)
+    return choice.split("\t", 1)[0] if choice else None
 
-    choice = pick(lines, with_nth="2")
-    if not choice:
-        return
-    name = choice.split("\t", 1)[0]
-    attach(name)
+
+def cmd_pick(args):
+    """Fuzzy-pick a session and print its name to stdout, without attaching —
+    the picker that other tools (e.g. linepick) reuse. --all includes remnants;
+    --query pre-selects a name. Exits non-zero (printing nothing) when nothing
+    is picked."""
+    require("tmux")
+    sessions = all_sessions_recent() if args.all else running_sessions_recent()
+    if not sessions:
+        print("no sessions to pick from", file=sys.stderr)
+        return 1
+    name = pick_session(sessions, query=args.query)
+    if not name:
+        return 1
+    print(name)
+    return 0
 
 
 def cmd_rm(args):
@@ -557,29 +594,34 @@ def cmd_logs(args):
         sys.stdout.write(path.read_text())
 
 
-def pick(lines, preview="_preview", prompt="session> ", with_nth="1,2", key="1"):
+def pick(lines, preview="_preview", prompt="session> ", with_nth="1,2", key="1",
+         query=None):
     """Pick one of `lines` (tab-separated fields). `with_nth` selects which
     fields fzf shows; `key` is the field index handed to the `preview`
-    subcommand. Returns the full chosen line — callers parse out the field they
-    need (the key field is always field 1 in our callers)."""
+    subcommand. `query`, if given, pre-fills fzf's search box. Returns the full
+    chosen line — callers parse out the field they need (the key field is always
+    field 1 in our callers)."""
     if shutil.which("fzf"):
         self_path = os.path.realpath(sys.argv[0])
         preview_cmd = (
             f"{shlex.quote(sys.executable)} {shlex.quote(self_path)} {preview} {{{key}}}"
         )
+        fzf_args = [
+            "fzf",
+            "--delimiter", "\t",
+            "--with-nth", with_nth,
+            "--prompt", prompt,
+            # fzf's default scheme assumes a dark terminal and tints the
+            # gutter (bg+), which shows as a black strip on a light one.
+            # -1 = terminal default, so it blends in either way.
+            "--color", "gutter:-1",
+            "--preview", preview_cmd,
+            "--preview-window", "right,55%,wrap",
+        ]
+        if query:
+            fzf_args += ["--query", query]
         res = subprocess.run(
-            [
-                "fzf",
-                "--delimiter", "\t",
-                "--with-nth", with_nth,
-                "--prompt", prompt,
-                # fzf's default scheme assumes a dark terminal and tints the
-                # gutter (bg+), which shows as a black strip on a light one.
-                # -1 = terminal default, so it blends in either way.
-                "--color", "gutter:-1",
-                "--preview", preview_cmd,
-                "--preview-window", "right,55%,wrap",
-            ],
+            fzf_args,
             input="\n".join(lines),
             text=True,
             stdout=subprocess.PIPE,
@@ -695,7 +737,7 @@ def cmd_ls(args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(prog="tmgr", description="A small tmux session manager.")
-    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,rm,log,logs,ls}")
+    sub = p.add_subparsers(dest="cmd", metavar="{new,edit,a,pick,rm,log,logs,ls}")
 
     pn = sub.add_parser("new", help="create + attach to a tracked session")
     pn.add_argument("name")
@@ -709,6 +751,11 @@ def build_parser():
     pa = sub.add_parser("a", help="attach to a session (fuzzy-pick if no name given)")
     pa.add_argument("name", nargs="?", help="session to attach to (default: pick with fzf)")
     pa.set_defaults(func=cmd_a)
+
+    pp = sub.add_parser("pick", help="fuzzy-pick a session and print its name (no attach)")
+    pp.add_argument("--all", action="store_true", help="include non-running remnants")
+    pp.add_argument("--query", metavar="STR", help="pre-fill the search (pre-select a name)")
+    pp.set_defaults(func=cmd_pick)
 
     pr = sub.add_parser("rm", help="delete a non-running session's tracking files")
     pr.add_argument("name")
@@ -744,7 +791,7 @@ def main(argv=None):
     if not getattr(args, "func", None):
         parser.print_help()
         sys.exit(2)
-    args.func(args)
+    sys.exit(args.func(args) or 0)
 
 
 if __name__ == "__main__":

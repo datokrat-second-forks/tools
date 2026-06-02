@@ -37,6 +37,7 @@ Requirements:
 | `tmgr new <name> [-m DESC]` | Create a tracked session and attach to it. |
 | `tmgr edit <name>` | Open `<name>.session` in `$EDITOR` (default `vim`). |
 | `tmgr a [name]` | Attach to `name` directly, or fuzzy-pick a **running** session if no name is given. |
+| `tmgr pick [--all]` | Fuzzy-pick a session (same menu + preview as `tmgr a`) and **print its name** instead of attaching — for scripts/other tools. `--all` includes non-running remnants. |
 | `tmgr rm <name>` | Delete a **non-running** session's tracking files, after a confirmation showing its description. |
 | `tmgr log [text]` | Append `text` to the **current** session's log (must be run inside tmux). |
 | `tmgr logs [name]` | Show a session log: fuzzy-pick one with `fzf`, or pass a name. |
