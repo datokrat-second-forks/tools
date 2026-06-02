@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""linepick - fill the target of a [[...]] wiki link under the cursor.
+
+Invocation (the form Vim uses):
+
+    linepick <infile> <outfile>     # read JSON request, write JSON response
+
+With no arguments it reads the request on stdin and writes to stdout, which is
+handy for quick shell testing. The JSON shape is the same either way:
+
+    request   {"line": "<text>", "col": <n>}
+    response  {"line": "<text>", "col": <n>}
+
+`col` is the 1-based cursor column as Vim reports it (a byte offset into the
+line). The response's `line` replaces the current line and `col` repositions
+the cursor.
+
+A link's fillable target is the part after an optional `name|`:
+
+    [[name|target]]     target is everything after the pipe
+    [[target]]          the whole inner text (no pipe)
+
+When the cursor is on a link, an interactive chooser fills the target and the
+cursor lands just past the link. The target's leading `type:` (if any) selects
+the chooser and is preserved:
+
+    [[session:?]]            -> linepick-session fills the part after `session:`
+    [[name|session:?]]       -> same, keeping `name|session:`
+    [[name|path]]            -> $LINEPICK_PICKER (default `fzf`) replaces `path`
+    [[name]]                 -> $LINEPICK_PICKER result inserted as `|path`
+
+A `type` dispatches to an executable `linepick-<type>` found in
+$LINEPICK_HANDLER_DIR, else beside this script, else on $PATH; it is run with
+the current target value as its argument and prints the chosen value. Unknown
+types (no such handler) fall back to $LINEPICK_PICKER. Off a link, or when the
+chooser is cancelled (non-zero exit / empty output), the line is unchanged.
+
+Choosers draw their UI on /dev/tty and print the choice to stdout; using file
+arguments (not stdin/stdout) for the JSON keeps the tool's terminal free.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# Inner text of a link: anything but brackets. A '|' (if present) separates the
+# name from the target; without one the whole inner text is the target.
+LINK_RE = re.compile(r"\[\[([^\[\]]*)\]\]")
+# A target that begins `type:` routes to the linepick-<type> handler.
+TYPE_RE = re.compile(r"([A-Za-z][\w-]*):(.*)$")
+
+
+def _byte_to_char(line, bcol):
+    """1-based byte column (as Vim reports) -> 0-based character index."""
+    raw = line.encode("utf-8")
+    bcol = max(1, min(bcol, len(raw) + 1))
+    return len(raw[: bcol - 1].decode("utf-8", "ignore"))
+
+
+def _char_to_byte(line, cidx):
+    """0-based character index -> 1-based byte column."""
+    return len(line[:cidx].encode("utf-8")) + 1
+
+
+def find_link(line, cidx):
+    """The [[...]] match covering character index cidx, or None."""
+    for m in LINK_RE.finditer(line):
+        if m.start() <= cidx < m.end():
+            return m
+    return None
+
+
+def _capture(cmd, shell):
+    """Run a chooser command (string for shell=True, argv list otherwise) with
+    /dev/tty as stdin and return its trimmed stdout, or None if it failed/empty.
+
+    /dev/tty is opened so an fzf-style chooser draws its UI and lists from its
+    own source even though our stdin carries no candidates."""
+    try:
+        tty = open("/dev/tty")
+    except OSError:
+        tty = None
+    try:
+        proc = subprocess.run(cmd, shell=shell, stdin=tty, stdout=subprocess.PIPE, text=True)
+    finally:
+        if tty is not None:
+            tty.close()
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _find_handler(type_):
+    """Path to the executable `linepick-<type>` handler, or None if absent."""
+    name = "linepick-" + type_
+    base = os.environ.get("LINEPICK_HANDLER_DIR") or os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(base, name)
+    if os.access(local, os.X_OK):
+        return local
+    return shutil.which(name)
+
+
+def resolve(type_, current):
+    """Return the chosen value for a target, or None if cancelled. A known
+    `type` runs its handler with `current` as argument; otherwise (untyped, or
+    unknown type) the value comes from $LINEPICK_PICKER (default `fzf`)."""
+    if type_ is not None:
+        handler = _find_handler(type_)
+        if handler is not None:
+            return _capture([handler, current], shell=False)
+    return _capture(os.environ.get("LINEPICK_PICKER", "fzf"), shell=True)
+
+
+def transform(line, col, resolve=resolve):
+    """Return (new_line, new_col); see module docstring for the rules."""
+    cidx = _byte_to_char(line, col)
+    m = find_link(line, cidx)
+    if m is None:
+        return line, col
+    inner, inner_end = m.group(1), m.end(1)
+    bar = inner.find("|")
+    has_pipe = bar != -1
+    target_start = m.start(1) + (bar + 1 if has_pipe else 0)
+    target = inner[bar + 1:] if has_pipe else inner
+
+    tm = TYPE_RE.match(target)
+    if tm:                                 # type:path -> replace path, keep type:
+        ps, pe = target_start + tm.start(2), inner_end
+    elif has_pipe:                         # [[name|path]] -> replace path
+        ps, pe = target_start, inner_end
+    else:                                  # [[name]] -> insert |value before ]]
+        ps = pe = inner_end
+
+    value = resolve(tm.group(1) if tm else None, line[ps:pe])
+    if not value:
+        return line, col
+    insert = value if (tm or has_pipe) else "|" + value
+    new_line = line[:ps] + insert + line[pe:]
+    end_char = m.end() + (len(insert) - (pe - ps))
+    return new_line, _char_to_byte(new_line, end_char)
+
+
+def main(argv):
+    if len(argv) == 2:
+        with open(argv[0], encoding="utf-8") as f:
+            req = json.load(f)
+    else:
+        req = json.load(sys.stdin)
+    line, col = transform(req["line"], req["col"])
+    out = {"line": line, "col": col}
+    if len(argv) == 2:
+        with open(argv[1], "w", encoding="utf-8") as f:
+            json.dump(out, f)
+    else:
+        json.dump(out, sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

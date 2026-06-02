@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# linepick handler for [[session:...]] links: fuzzy-pick a tmgr session (with
+# tmgr's own preview niceties) and print its name. --all so you can link to a
+# tracked session even when it isn't currently running.
+#
+# linepick passes the link's current target value as $1. When it's a real name
+# (editing an existing [[session:mysession]]) we pre-fill the fzf query so that
+# session starts selected; the "?" placeholder (a fresh link) is ignored.
+cur="${1:-}"
+if [ -n "$cur" ] && [ "$cur" != "?" ]; then
+  exec tmgr pick --all --query "$cur"
+fi
+exec tmgr pick --all
