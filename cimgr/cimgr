@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""cimgr - helpers for complex Lean 4 CI tasks.
+
+Commands:
+
+    cimgr stats lean4 [commit]    collect CI-relevant facts about a lean4 commit
+
+`stats lean4` reports, for a commit of the leanprover/lean4 repository:
+
+  * its merge base with master (plus ahead/behind counts),
+  * the most recent nightly release (a `nightly-YYYY-MM-DD` tag of
+    leanprover/lean4-nightly) the commit is based on, and
+  * the most recent such nightly that also has a mathlib4 nightly-testing
+    release, together with the corresponding commit of
+    leanprover-community/mathlib4-nightly-testing.
+
+With no commit argument, the HEAD of the Git repository in the current
+directory is used (assumed to be a lean4 checkout). All data comes from the
+GitHub API; nightly tags share their commit objects with leanprover/lean4, so
+ancestry checks run entirely against that repo. Set GITHUB_TOKEN (or GH_TOKEN)
+to lift the unauthenticated rate limit of 60 requests/hour.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+LEAN_REPO = "leanprover/lean4"
+NIGHTLY_REPO = "leanprover/lean4-nightly"
+MATHLIB_REPO = "leanprover-community/mathlib4-nightly-testing"
+
+# How many days back from the merge base we search for a nightly before
+# concluding something is wrong (a commit's merge base is never far ahead of
+# the nightlies cut from the same history).
+MAX_LOOKBACK_DAYS = 60
+
+# When scanning forward for ever-newer nightlies still based on the merge
+# base, give up after this many consecutive days without a nightly tag.
+MAX_FORWARD_GAP_DAYS = 7
+
+
+class CimgrError(Exception):
+    """A user-facing error; main() prints it and exits 1."""
+
+
+# --------------------------------------------------------------------------- #
+# GitHub API
+# --------------------------------------------------------------------------- #
+class GitHub:
+    """Minimal GitHub REST client. Tests replace this with a stub."""
+
+    def __init__(self, token=None):
+        self.token = (
+            token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        )
+
+    def get(self, path):
+        """GET /<path>. Returns (status, parsed JSON); 404 -> (404, None)."""
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "cimgr",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(
+            f"https://api.github.com/{path}", headers=headers
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as err:
+            # 404 = missing ref/tag; 422 = sha-shaped ref that doesn't exist.
+            if err.code in (404, 422):
+                return err.code, None
+            if err.code in (403, 429) and err.headers.get(
+                "X-RateLimit-Remaining"
+            ) == "0":
+                raise CimgrError(
+                    "GitHub API rate limit exhausted; set GITHUB_TOKEN to "
+                    "authenticate (5000 requests/hour instead of 60)."
+                )
+            raise CimgrError(f"GitHub API error {err.code} for {path}")
+        except urllib.error.URLError as err:
+            raise CimgrError(f"cannot reach GitHub: {err.reason}")
+
+
+# --------------------------------------------------------------------------- #
+# lookups
+# --------------------------------------------------------------------------- #
+def parse_date(iso_datetime):
+    """The date part of an API timestamp like 2026-06-10T12:34:56Z."""
+    return datetime.date.fromisoformat(iso_datetime[:10])
+
+
+def commit_info(gh, ref):
+    """Resolve any ref/sha in leanprover/lean4 to (sha, subject, date)."""
+    status, data = gh.get(f"repos/{LEAN_REPO}/commits/{ref}")
+    if data is None:
+        raise CimgrError(
+            f"commit {ref!r} not found in {LEAN_REPO} — is it pushed?"
+        )
+    subject = data["commit"]["message"].splitlines()[0]
+    return data["sha"], subject, parse_date(data["commit"]["committer"]["date"])
+
+
+def merge_base(gh, sha):
+    """Merge base of sha with master: (mb_sha, mb_date, ahead_by, behind_by)."""
+    status, data = gh.get(f"repos/{LEAN_REPO}/compare/master...{sha}")
+    if data is None:
+        raise CimgrError(f"cannot compare {sha} with master in {LEAN_REPO}")
+    mb = data["merge_base_commit"]
+    return (
+        mb["sha"],
+        parse_date(mb["commit"]["committer"]["date"]),
+        data["ahead_by"],
+        data["behind_by"],
+    )
+
+
+def is_ancestor(gh, ancestor, descendant):
+    """True if `ancestor` is an ancestor of (or equal to) `descendant`."""
+    status, data = gh.get(
+        f"repos/{LEAN_REPO}/compare/{descendant}...{ancestor}"
+    )
+    if data is None:
+        return False
+    return data["ahead_by"] == 0
+
+
+def tag_sha(gh, repo, tag):
+    """The commit sha a tag points at, or None if the tag doesn't exist."""
+    status, data = gh.get(f"repos/{repo}/git/ref/tags/{tag}")
+    return None if data is None else data["object"]["sha"]
+
+
+def nightly_tag(date):
+    return f"nightly-{date.isoformat()}"
+
+
+def mathlib_tag(date):
+    return f"nightly-testing-{date.isoformat()}"
+
+
+# --------------------------------------------------------------------------- #
+# nightly resolution
+# --------------------------------------------------------------------------- #
+def today():
+    """Now, as a date. Separate function so tests can stub it."""
+    return datetime.date.today()
+
+
+def find_nightly(gh, mb_sha, mb_date):
+    """Most recent nightly that is an ancestor of the merge base.
+
+    The commit a nightly tags only ever advances along master, so the
+    nightlies based on the merge base form a contiguous date range. Walk back
+    from the day after the merge base's commit date to find one of them
+    cheaply (the nightly cut on that day or earlier tags a commit at or below
+    the merge base), then walk forward — later nightlies may still tag
+    history at or below the merge base when master is quiet or nightlies were
+    skipped. Returns (date, tag, sha).
+    """
+    found = None
+    one_day = datetime.timedelta(days=1)
+    date = mb_date + one_day
+    for _ in range(MAX_LOOKBACK_DAYS + 1):
+        sha = tag_sha(gh, NIGHTLY_REPO, nightly_tag(date))
+        if sha and is_ancestor(gh, sha, mb_sha):
+            found = (date, sha)
+            break
+        date -= one_day
+    if found is None:
+        raise CimgrError(
+            f"no nightly ancestor of merge base {mb_sha[:12]} within "
+            f"{MAX_LOOKBACK_DAYS} days before {mb_date}"
+        )
+    date, sha = found
+    scan, missing = date + one_day, 0
+    while scan <= today() and missing < MAX_FORWARD_GAP_DAYS:
+        nxt = tag_sha(gh, NIGHTLY_REPO, nightly_tag(scan))
+        if nxt is None:
+            missing += 1
+        elif is_ancestor(gh, nxt, mb_sha):
+            date, sha, missing = scan, nxt, 0
+        else:
+            break
+        scan += one_day
+    return date, nightly_tag(date), sha
+
+
+def find_nightly_with_mathlib(gh, mb_sha, from_date):
+    """Most recent nightly <= from_date that also has a mathlib4
+    nightly-testing release. Returns (tag, sha, mathlib_tag, mathlib_sha)."""
+    one_day = datetime.timedelta(days=1)
+    date = from_date
+    for _ in range(MAX_LOOKBACK_DAYS + 1):
+        lean_sha = tag_sha(gh, NIGHTLY_REPO, nightly_tag(date))
+        if lean_sha:
+            ml_sha = tag_sha(gh, MATHLIB_REPO, mathlib_tag(date))
+            # The ancestry check is redundant for dates at or before the
+            # nightly found by find_nightly (master is linear), but cheap.
+            if ml_sha and is_ancestor(gh, lean_sha, mb_sha):
+                return nightly_tag(date), lean_sha, mathlib_tag(date), ml_sha
+        date -= one_day
+    raise CimgrError(
+        f"no nightly with a mathlib nightly-testing release within "
+        f"{MAX_LOOKBACK_DAYS} days before {from_date}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+def local_head():
+    """HEAD of the git repo in the current directory."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        raise CimgrError("git not found; pass a commit hash explicitly")
+    if proc.returncode != 0:
+        raise CimgrError(
+            "cannot determine local HEAD (not in a git repo?); "
+            "pass a commit hash explicitly"
+        )
+    return proc.stdout.strip()
+
+
+def gather_stats(gh, ref):
+    sha, subject, commit_date = commit_info(gh, ref)
+    mb_sha, mb_date, ahead, behind = merge_base(gh, sha)
+    n_date, n_tag, n_sha = find_nightly(gh, mb_sha, mb_date)
+    m_tag, m_sha, ml_tag, ml_sha = find_nightly_with_mathlib(gh, mb_sha, n_date)
+    return {
+        "commit": {"sha": sha, "subject": subject, "date": commit_date.isoformat()},
+        "merge_base": {"sha": mb_sha, "ahead_by": ahead, "behind_by": behind},
+        "nightly": {"tag": n_tag, "sha": n_sha},
+        "nightly_with_mathlib": {
+            "tag": m_tag,
+            "sha": m_sha,
+            "mathlib": {"tag": ml_tag, "sha": ml_sha},
+        },
+    }
+
+
+def render_stats(stats):
+    short = lambda sha: sha[:12]
+    c, mb = stats["commit"], stats["merge_base"]
+    n, m = stats["nightly"], stats["nightly_with_mathlib"]
+    ml = m["mathlib"]
+    same = "  (same)" if m["tag"] == n["tag"] else ""
+    return "\n".join(
+        [
+            f"commit:              {short(c['sha'])}  {c['subject']} ({c['date']})",
+            f"merge base:          {short(mb['sha'])}  "
+            f"({mb['ahead_by']} ahead, {mb['behind_by']} behind master)",
+            f"nightly:             {n['tag']}  {short(n['sha'])}",
+            f"nightly w/ mathlib:  {m['tag']}  {short(m['sha'])}{same}",
+            f"  mathlib4-nightly-testing: {ml['tag']}  {short(ml['sha'])}",
+        ]
+    )
+
+
+def cmd_stats_lean4(args):
+    gh = GitHub()
+    ref = args.commit or local_head()
+    stats = gather_stats(gh, ref)
+    if args.json:
+        print(json.dumps(stats, indent=2))
+    else:
+        print(render_stats(stats))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="cimgr", description="Helpers for complex Lean 4 CI tasks."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    stats = sub.add_parser(
+        "stats", help="collect CI-relevant facts about a commit"
+    )
+    stats_sub = stats.add_subparsers(dest="repo", required=True)
+
+    lean4 = stats_sub.add_parser("lean4", help="stats for a lean4 commit")
+    lean4.add_argument(
+        "commit",
+        nargs="?",
+        help="commit hash or ref in leanprover/lean4 "
+        "(default: HEAD of the repo in the current directory)",
+    )
+    lean4.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    lean4.set_defaults(func=cmd_stats_lean4)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except CimgrError as err:
+        print(f"cimgr: error: {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
