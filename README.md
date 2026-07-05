@@ -15,7 +15,8 @@ Note: I'm using these inside a heavily restrained sandbox, and they were develop
 | [`leansnip`](leansnip/) | Manage VSCode Lean 4 snippets from a single git repo: keeps `lean4.json` in a repo you own and symlinks it into each installed editor's user-snippets dir, so the repo stays the source of truth while VSCode edits write straight back. |
 | [`lean-infoview-cors`](lean-infoview-cors/) | Patch the Lean 4 VS Code extension's bundled `extension.js` to add `crossorigin="anonymous"` to the InfoView stylesheet link, so the InfoView renders styled under code-server. Idempotent; reapply after each extension upgrade. |
 | [`scion`](scion/) | Describe a stack of Git branches as labeled ranges (substrate / essence / computed) in a `.scions/` manifest; inspect, health-check, and edit them, then `apply` one scion's essence onto another, one reviewable step at a time. |
-| [`cimgr`](cimgr/) | Helpers for complex Lean 4 CI tasks: `stats lean4 [commit]` reports a lean4 commit's merge base with master, the most recent nightly release it's based on, and the newest such nightly that also has a mathlib4 nightly-testing release (with its commit). All via the GitHub API — no local clones needed. |
+| [`cimgr`](cimgr/) | Helpers for complex Lean 4 CI tasks: `stats lean4 [commit]` reports a lean4 commit's merge base with master, the most recent nightly release it's based on, the newest such nightly that also has a mathlib4 nightly-testing release (with its commit), and the newest that has a reference-manual build. All via the GitHub API — no local clones needed. |
+| [`impgraph`](impgraph/) | Analyze the Lean 4 module import graph straight from the source tree: `impact` models adding/removing an `import` (closure growth, cycle detection, downstream footprint), distinguishing build-order edges from `public import` visibility; plus `closure`, `path`, and `importers`. |
 
 ## Layout
 

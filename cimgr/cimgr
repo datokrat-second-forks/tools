@@ -9,10 +9,14 @@ Commands:
 
   * its merge base with master (plus ahead/behind counts),
   * the most recent nightly release (a `nightly-YYYY-MM-DD` tag of
-    leanprover/lean4-nightly) the commit is based on, and
+    leanprover/lean4-nightly) the commit is based on,
   * the most recent such nightly that also has a mathlib4 nightly-testing
     release, together with the corresponding commit of
-    leanprover-community/mathlib4-nightly-testing.
+    leanprover-community/mathlib4-nightly-testing and the batteries and
+    quote4 (Qq) versions that mathlib's lake-manifest.json pins there, and
+  * the most recent such nightly that also has a reference-manual build (a
+    nightly-testing release of leanprover/reference-manual), with the
+    corresponding commit.
 
 With no commit argument, the HEAD of the Git repository in the current
 directory is used (assumed to be a lean4 checkout). All data comes from the
@@ -22,6 +26,7 @@ to lift the unauthenticated rate limit of 60 requests/hour.
 """
 
 import argparse
+import base64
 import datetime
 import json
 import os
@@ -33,6 +38,11 @@ import urllib.request
 LEAN_REPO = "leanprover/lean4"
 NIGHTLY_REPO = "leanprover/lean4-nightly"
 MATHLIB_REPO = "leanprover-community/mathlib4-nightly-testing"
+REFMAN_REPO = "leanprover/reference-manual"
+
+# Mathlib dependencies whose pinned versions we surface, as they appear in
+# mathlib's lake-manifest.json (quote4 is listed under the name "Qq").
+DEP_PACKAGES = ("batteries", "Qq")
 
 # How many days back from the merge base we search for a nightly before
 # concluding something is wrong (a commit's merge base is never far ahead of
@@ -146,6 +156,11 @@ def mathlib_tag(date):
     return f"nightly-testing-{date.isoformat()}"
 
 
+# leanprover/reference-manual follows the same nightly-testing-<date> tag
+# convention as mathlib4-nightly-testing.
+refman_tag = mathlib_tag
+
+
 # --------------------------------------------------------------------------- #
 # nightly resolution
 # --------------------------------------------------------------------------- #
@@ -193,24 +208,68 @@ def find_nightly(gh, mb_sha, mb_date):
     return date, nightly_tag(date), sha
 
 
-def find_nightly_with_mathlib(gh, mb_sha, from_date):
-    """Most recent nightly <= from_date that also has a mathlib4
-    nightly-testing release. Returns (tag, sha, mathlib_tag, mathlib_sha)."""
+def find_nightly_with_release(gh, mb_sha, from_date, repo, tag_fn, what):
+    """Most recent nightly <= from_date that also has a nightly-testing
+    release tagged in `repo`. Returns (tag, sha, rel_tag, rel_sha).
+
+    `tag_fn` maps a date to the release tag name in `repo`; `what` names the
+    release for the error message. Releases (mathlib's, the reference
+    manual's) are tagged only on a subset of nightly dates, so walk back day
+    by day until a date carries both a lean nightly and the release.
+    """
     one_day = datetime.timedelta(days=1)
     date = from_date
     for _ in range(MAX_LOOKBACK_DAYS + 1):
         lean_sha = tag_sha(gh, NIGHTLY_REPO, nightly_tag(date))
         if lean_sha:
-            ml_sha = tag_sha(gh, MATHLIB_REPO, mathlib_tag(date))
+            rel_sha = tag_sha(gh, repo, tag_fn(date))
             # The ancestry check is redundant for dates at or before the
             # nightly found by find_nightly (master is linear), but cheap.
-            if ml_sha and is_ancestor(gh, lean_sha, mb_sha):
-                return nightly_tag(date), lean_sha, mathlib_tag(date), ml_sha
+            if rel_sha and is_ancestor(gh, lean_sha, mb_sha):
+                return nightly_tag(date), lean_sha, tag_fn(date), rel_sha
         date -= one_day
     raise CimgrError(
-        f"no nightly with a mathlib nightly-testing release within "
+        f"no nightly with a {what} within "
         f"{MAX_LOOKBACK_DAYS} days before {from_date}"
     )
+
+
+def find_nightly_with_mathlib(gh, mb_sha, from_date):
+    """Most recent nightly <= from_date that also has a mathlib4
+    nightly-testing release. Returns (tag, sha, mathlib_tag, mathlib_sha)."""
+    return find_nightly_with_release(
+        gh, mb_sha, from_date, MATHLIB_REPO, mathlib_tag,
+        "mathlib nightly-testing release",
+    )
+
+
+def find_nightly_with_refman(gh, mb_sha, from_date):
+    """Most recent nightly <= from_date that also has a reference-manual
+    build (a nightly-testing release of leanprover/reference-manual).
+    Returns (tag, sha, refman_tag, refman_sha)."""
+    return find_nightly_with_release(
+        gh, mb_sha, from_date, REFMAN_REPO, refman_tag,
+        "reference-manual nightly-testing release",
+    )
+
+
+def mathlib_deps(gh, ml_sha):
+    """Pinned revs of DEP_PACKAGES at mathlib commit `ml_sha`.
+
+    Reads mathlib's lake-manifest.json via the GitHub contents API and returns
+    an ordered {name: rev} for each requested package, in DEP_PACKAGES order;
+    a package absent from the manifest maps to None.
+    """
+    status, data = gh.get(
+        f"repos/{MATHLIB_REPO}/contents/lake-manifest.json?ref={ml_sha}"
+    )
+    if data is None:
+        raise CimgrError(
+            f"lake-manifest.json not found in {MATHLIB_REPO} at {ml_sha[:12]}"
+        )
+    manifest = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+    revs = {pkg["name"]: pkg.get("rev") for pkg in manifest.get("packages", [])}
+    return {name: revs.get(name) for name in DEP_PACKAGES}
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +296,8 @@ def gather_stats(gh, ref):
     mb_sha, mb_date, ahead, behind = merge_base(gh, sha)
     n_date, n_tag, n_sha = find_nightly(gh, mb_sha, mb_date)
     m_tag, m_sha, ml_tag, ml_sha = find_nightly_with_mathlib(gh, mb_sha, n_date)
+    deps = mathlib_deps(gh, ml_sha)
+    r_tag, r_sha, rm_tag, rm_sha = find_nightly_with_refman(gh, mb_sha, n_date)
     return {
         "commit": {"sha": sha, "subject": subject, "date": commit_date.isoformat()},
         "merge_base": {"sha": mb_sha, "ahead_by": ahead, "behind_by": behind},
@@ -244,27 +305,43 @@ def gather_stats(gh, ref):
         "nightly_with_mathlib": {
             "tag": m_tag,
             "sha": m_sha,
-            "mathlib": {"tag": ml_tag, "sha": ml_sha},
+            "mathlib": {"tag": ml_tag, "sha": ml_sha, "deps": deps},
+        },
+        "nightly_with_refman": {
+            "tag": r_tag,
+            "sha": r_sha,
+            "reference_manual": {"tag": rm_tag, "sha": rm_sha},
         },
     }
 
 
+DEP_LABELS = {"batteries": "batteries", "Qq": "Qq (quote4)"}
+
+
 def render_stats(stats):
-    short = lambda sha: sha[:12]
+    short = lambda sha: sha[:12] if sha else "(absent)"
     c, mb = stats["commit"], stats["merge_base"]
-    n, m = stats["nightly"], stats["nightly_with_mathlib"]
-    ml = m["mathlib"]
+    n, m, r = stats["nightly"], stats["nightly_with_mathlib"], stats[
+        "nightly_with_refman"
+    ]
+    ml, rm = m["mathlib"], r["reference_manual"]
     same = "  (same)" if m["tag"] == n["tag"] else ""
-    return "\n".join(
-        [
-            f"commit:              {short(c['sha'])}  {c['subject']} ({c['date']})",
-            f"merge base:          {short(mb['sha'])}  "
-            f"({mb['ahead_by']} ahead, {mb['behind_by']} behind master)",
-            f"nightly:             {n['tag']}  {short(n['sha'])}",
-            f"nightly w/ mathlib:  {m['tag']}  {short(m['sha'])}{same}",
-            f"  mathlib4-nightly-testing: {ml['tag']}  {short(ml['sha'])}",
-        ]
-    )
+    rsame = "  (same)" if r["tag"] == n["tag"] else ""
+    lines = [
+        f"commit:              {short(c['sha'])}  {c['subject']} ({c['date']})",
+        f"merge base:          {short(mb['sha'])}  "
+        f"({mb['ahead_by']} ahead, {mb['behind_by']} behind master)",
+        f"nightly:             {n['tag']}  {short(n['sha'])}",
+        f"nightly w/ mathlib:  {m['tag']}  {short(m['sha'])}{same}",
+        f"  mathlib4-nightly-testing: {ml['tag']}  {short(ml['sha'])}",
+    ]
+    for name, rev in ml.get("deps", {}).items():
+        lines.append(f"    {DEP_LABELS.get(name, name)}: {short(rev)}")
+    lines += [
+        f"nightly w/ refman:   {r['tag']}  {short(r['sha'])}{rsame}",
+        f"  reference-manual: {rm['tag']}  {short(rm['sha'])}",
+    ]
+    return "\n".join(lines)
 
 
 def cmd_stats_lean4(args):

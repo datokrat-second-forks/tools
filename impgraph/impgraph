@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""impgraph - analyze the Lean 4 module import graph.
+
+Commands:
+
+    impgraph closure <module>           transitive import closure of a module
+    impgraph path <from> <to>           an import path between two modules (cycle check)
+    impgraph importers <module>         modules that transitively import a module
+    impgraph impact <module> --add ...  what adding (or removing) imports does to the graph
+
+A *module* is a dotted name like `Lean.AddDecl`, mapped to a file
+`<root>/Lean/AddDecl.lean`. The root defaults to `./src` when it exists (the
+layout of a lean4 checkout), otherwise to `.`; override it with `--root`.
+
+The `impact` command is the headline feature. Given a module and a set of
+imports you are considering adding to it, it reports:
+
+  * the new modules pulled into that module's own build-dependency closure,
+  * whether any added import would create an import cycle, and
+  * the *downstream* footprint: of all modules that transitively import the
+    target, how many already had each added module in their closure (i.e. how
+    many would gain it only because of your change).
+
+`--add`/`--remove` are hypothetical: they work whether or not the imports are
+already present in the file, so you can plan a change before making it.
+
+Imports are parsed syntactically, tolerating `public`/`meta` modifiers and
+`import all`; text inside block comments / docstrings (e.g. fenced `import`
+examples) is ignored.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict, deque
+
+# `import X`, `public import X`, `meta import X`, `public meta import all X`, ...
+# Group 1 captures the `public`/`meta` modifiers (to tell public from private imports).
+IMPORT_RE = re.compile(
+    r'^[ \t]*((?:(?:public|meta)[ \t]+){0,2})import[ \t]+(?:all[ \t]+)?([A-Za-z0-9_.]+)',
+    re.M,
+)
+# Block comments / docstrings, including ```-fenced code that may contain
+# example `import` lines. Non-greedy; nested block comments are not handled
+# (rare in an import region).
+BLOCK_COMMENT_RE = re.compile(r'/-.*?-/', re.S)
+FENCE_RE = re.compile(r'```.*?```', re.S)
+
+
+def strip_noncode(text):
+    """Remove block comments and fenced code so stray `import` lines don't match."""
+    text = FENCE_RE.sub('', text)
+    return BLOCK_COMMENT_RE.sub('', text)
+
+
+class Graph:
+    """The import graph rooted at a Lean source directory."""
+
+    def __init__(self, root):
+        self.root = root
+        self._imports = {}        # module -> tuple(imports), cached
+        self._nodes = None        # set of file-backed modules (lazy)
+
+    def path_of(self, module):
+        return os.path.join(self.root, module.replace('.', os.sep) + '.lean')
+
+    def imports(self, module):
+        """Direct imports of `module` as `(name, is_public)` pairs.
+
+        Empty for a module with no source file. `is_public` is true for
+        `public import` (re-exported / transitively visible); false for a plain
+        private `import`.
+        """
+        cached = self._imports.get(module)
+        if cached is not None:
+            return cached
+        p = self.path_of(module)
+        if not os.path.isfile(p):
+            result = ()
+        else:
+            with open(p, encoding='utf-8', errors='replace') as f:
+                text = strip_noncode(f.read())
+            # De-dup by name while preserving order; a name counts as public if
+            # any of its import lines is public.
+            order, pub = [], {}
+            for mods, name in IMPORT_RE.findall(text):
+                is_public = 'public' in mods
+                if name not in pub:
+                    order.append(name)
+                pub[name] = pub.get(name, False) or is_public
+            result = tuple((name, pub[name]) for name in order)
+        self._imports[module] = result
+        return result
+
+    def neighbors(self, module, public_only, override):
+        """Names directly imported by `module`, honoring `public_only`/`override`."""
+        edges = override[module] if module in override else self.imports(module)
+        return [name for name, is_public in edges if is_public or not public_only]
+
+    def nodes(self):
+        """All file-backed modules under the root."""
+        if self._nodes is None:
+            nodes = set()
+            for dirpath, _, files in os.walk(self.root):
+                for fn in files:
+                    if fn.endswith('.lean'):
+                        rel = os.path.relpath(os.path.join(dirpath, fn), self.root)
+                        nodes.add(rel[:-len('.lean')].replace(os.sep, '.'))
+            self._nodes = nodes
+        return self._nodes
+
+    # --- traversals ---------------------------------------------------------
+
+    def closure(self, starts, public_only=False, override=None):
+        """Transitive imports of `starts` (excluding the starts themselves).
+
+        With `public_only`, follow only `public import` edges (transitive
+        visibility); otherwise follow every import (build-order dependency).
+        `override` maps a module to a replacement `(name, is_public)` list, used
+        to model a hypothetical edit without touching the file.
+        """
+        override = override or {}
+        seen, out = set(starts), set()
+        q = deque(starts)
+        while q:
+            for i in self.neighbors(q.popleft(), public_only, override):
+                if i not in seen:
+                    seen.add(i)
+                    out.add(i)
+                    q.append(i)
+        return out
+
+    def path(self, src, dst, public_only=False, override=None):
+        """A shortest import path src -> ... -> dst, or None."""
+        override = override or {}
+        if src == dst:
+            return [src]
+        prev = {src: None}
+        q = deque([src])
+        while q:
+            m = q.popleft()
+            for i in self.neighbors(m, public_only, override):
+                if i not in prev:
+                    prev[i] = m
+                    if i == dst:
+                        chain = [i]
+                        while chain[-1] is not None:
+                            chain.append(prev[chain[-1]])
+                        return list(reversed(chain[:-1]))
+                    q.append(i)
+        return None
+
+    def reverse_reachable(self, target, public_only=False, override=None):
+        """All modules whose closure contains `target` (i.e. that import it)."""
+        override = override or {}
+        radj = defaultdict(set)
+        for m in self.nodes():
+            for i in self.neighbors(m, public_only, override):
+                radj[i].add(m)
+        seen = set()
+        q = deque([target])
+        while q:
+            for m in radj.get(q.popleft(), ()):
+                if m not in seen:
+                    seen.add(m)
+                    q.append(m)
+        return seen
+
+
+def default_root():
+    return 'src' if os.path.isdir('src') else '.'
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_closure(g, args):
+    cl = g.closure([args.module], public_only=args.public)
+    if args.json:
+        print(json.dumps({'module': args.module, 'count': len(cl),
+                          'closure': sorted(cl)}, indent=2))
+        return 0
+    if args.count:
+        print(len(cl))
+        return 0
+    for m in sorted(cl):
+        print(m)
+    return 0
+
+
+def cmd_path(g, args):
+    p = g.path(args.src, args.dst, public_only=args.public)
+    if args.json:
+        print(json.dumps({'from': args.src, 'to': args.dst, 'path': p}, indent=2))
+        return 0 if p else 1
+    if p is None:
+        print(f"no import path: {args.src} does not (transitively) import {args.dst}")
+        return 1
+    print(' -> '.join(p))
+    return 0
+
+
+def cmd_importers(g, args):
+    imp = g.reverse_reachable(args.module, public_only=args.public)
+    if args.json:
+        print(json.dumps({'module': args.module, 'count': len(imp),
+                          'importers': sorted(imp)}, indent=2))
+        return 0
+    if args.count:
+        print(len(imp))
+        return 0
+    for m in sorted(imp):
+        print(m)
+    return 0
+
+
+def split_mods(values):
+    """Flatten repeated and comma-separated module lists into a name list."""
+    out = []
+    for v in values or []:
+        out.extend(part for part in v.replace(',', ' ').split() if part)
+    return out
+
+
+def parse_add(values):
+    """Parse `--add` entries into `(name, is_public)`; a `public:` prefix marks
+    an added import as a `public import` (the default is a private `import`)."""
+    out = []
+    for v in split_mods(values):
+        if v.startswith('public:'):
+            out.append((v[len('public:'):], True))
+        else:
+            out.append((v, False))
+    return out
+
+
+def cmd_impact(g, args):
+    module = args.module
+    pub = args.public
+    add = parse_add(args.add)              # [(name, is_public)]
+    add_names = [n for n, _ in add]
+    remove = set(split_mods(args.remove))
+
+    base = list(g.imports(module))         # [(name, is_public)]
+    before_imports = [(n, p) for n, p in base if n not in add_names and n not in remove]
+    after_imports = before_imports + add
+
+    before_cl = g.closure([module], public_only=pub, override={module: before_imports})
+    after_cl = g.closure([module], public_only=pub, override={module: after_imports})
+    new = sorted(after_cl - before_cl)
+    gone = sorted(before_cl - after_cl)
+
+    # Cycle check: would any added module reach `module`?
+    cycles = []
+    for a in add_names:
+        p = g.path(a, module, public_only=pub)
+        if p is not None:
+            cycles.append(p)
+
+    # Downstream footprint: of the modules that import `module`, how many
+    # reached each added module *before* the edit, and how many newly gain it.
+    # A private added import does not propagate in `--public` mode, so its gain
+    # is 0 there — hence we compare reachability before and after, rather than
+    # assuming every importer gains the dependency.
+    importers = g.reverse_reachable(module, public_only=pub)
+    downstream = []
+    for a in add_names:
+        had_before = g.reverse_reachable(a, public_only=pub, override={module: before_imports})
+        had_after = g.reverse_reachable(a, public_only=pub, override={module: after_imports})
+        already = len(importers & had_before)
+        gain = len(importers & (had_after - had_before))
+        downstream.append({
+            'module': a,
+            'importers_total': len(importers),
+            'already_had': already,
+            'gain_via_change': gain,
+        })
+
+    if args.json:
+        print(json.dumps({
+            'module': module,
+            'mode': 'public' if pub else 'build',
+            'add': add_names,
+            'remove': sorted(remove),
+            'closure_before': len(before_cl),
+            'closure_after': len(after_cl),
+            'new_in_closure': new,
+            'removed_from_closure': gone,
+            'cycles': cycles,
+            'importers_total': len(importers),
+            'downstream': downstream,
+        }, indent=2))
+        return 1 if cycles else 0
+
+    print(f"module: {module}")
+    print(f"  mode:   {'public (transitive visibility)' if pub else 'build (all imports)'}")
+    if add_names:
+        print(f"  add:    {', '.join(add_names)}")
+    if remove:
+        print(f"  remove: {', '.join(sorted(remove))}")
+    print()
+
+    if cycles:
+        print("CYCLE: the following added imports already import the target —")
+        print("       adding them would create an import cycle:")
+        for p in cycles:
+            print(f"  {' -> '.join(p)}")
+        print()
+
+    print(f"closure before: {len(before_cl)}")
+    print(f"closure after:  {len(after_cl)}")
+    print(f"new in closure: {len(new)}")
+    for m in new:
+        print(f"  + {m}")
+    for m in gone:
+        print(f"  - {m}")
+    print()
+
+    print(f"downstream: {len(importers)} modules transitively import {module}")
+    for d in downstream:
+        print(f"  {d['module']}: already had {d['already_had']}/{d['importers_total']}, "
+              f"{d['gain_via_change']} newly gain it")
+    return 1 if cycles else 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog='impgraph',
+        description='Analyze the Lean 4 module import graph.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument('--root', default=None,
+                   help="source root (default: ./src if present, else .)")
+    p.add_argument('--public', action='store_true',
+                   help="follow only `public import` edges (transitive visibility) "
+                        "instead of every import (build-order dependency)")
+    p.add_argument('--json', action='store_true', help="emit JSON")
+    sub = p.add_subparsers(dest='command', required=True)
+
+    sp = sub.add_parser('closure', help="transitive imports of a module")
+    sp.add_argument('module')
+    sp.add_argument('--count', action='store_true', help="print only the count")
+    sp.set_defaults(func=cmd_closure)
+
+    sp = sub.add_parser('path', help="an import path between two modules")
+    sp.add_argument('src', metavar='from')
+    sp.add_argument('dst', metavar='to')
+    sp.set_defaults(func=cmd_path)
+
+    sp = sub.add_parser('importers', help="modules that transitively import a module")
+    sp.add_argument('module')
+    sp.add_argument('--count', action='store_true', help="print only the count")
+    sp.set_defaults(func=cmd_importers)
+
+    sp = sub.add_parser('impact', help="effect of adding/removing imports")
+    sp.add_argument('module')
+    sp.add_argument('--add', action='append', metavar='MODS',
+                    help="module(s) to add (comma/space separated; repeatable)")
+    sp.add_argument('--remove', action='append', metavar='MODS',
+                    help="module(s) to remove (comma/space separated; repeatable)")
+    sp.set_defaults(func=cmd_impact)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    root = args.root if args.root is not None else default_root()
+    if not os.path.isdir(root):
+        print(f"impgraph: root directory not found: {root}", file=sys.stderr)
+        return 2
+    g = Graph(root)
+    return args.func(g, args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
